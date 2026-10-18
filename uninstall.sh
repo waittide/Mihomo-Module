@@ -33,8 +33,10 @@ while read -r _line; do
     _pref=$(echo "$_line" | awk -F: '{print $1}')
     [ -n "$_pref" ] && ip -4 rule del pref "$_pref" 2>/dev/null
 done
+ip -4 rule del fwmark "$_mark/$_mark" table "$_table" 2>/dev/null
 ip -4 rule del fwmark "$_mark" table "$_table" 2>/dev/null
 ip -4 route flush table "$_table" 2>/dev/null
+ip -6 rule del fwmark "$_mark/$_mark" table "$_table" 2>/dev/null
 ip -6 rule del fwmark "$_mark" table "$_table" 2>/dev/null
 ip -6 route flush table "$_table" 2>/dev/null
 

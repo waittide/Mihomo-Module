@@ -46,12 +46,18 @@ add_rule_route() {
     # 先按 table 清干净，避免改过 mark_id 后旧规则残留
     del_rules_for_table 4
     del_rules_for_table 6
-    ip -4 rule add fwmark "$mark_id" table "$table_id" pref "$pref_id" 2>/dev/null
+    # 必须带掩码 fwmark <mark>/<mark>。
+    # mangle 里用 `MARK --set-xmark $mark_id/$mark_id` 做的是「按位或写入」，
+    # Android 的 socket 自带 netId 标记（wifi netId=100 -> 0x10064），
+    # 实际 fwmark 会变成 0x10064|0x7e8 = 0x107ec。而 `ip rule add fwmark 0x7e8`
+    # 的掩码是 0xffffffff（必须精确相等），永远匹配不上 -> 包从 wlan0 逃逸、
+    # TPROXY 链零命中、应用直连超时。实测：换成 0x7e8/0x7e8 后立即恢复。
+    ip -4 rule add fwmark "$mark_id/$mark_id" table "$table_id" pref "$pref_id" 2>/dev/null
     ip -4 route flush table "$table_id" 2>/dev/null
     ip -4 route add local default dev lo table "$table_id" 2>/dev/null
 
     if [ "$ipv6" = "true" ]; then
-        ip -6 rule add fwmark "$mark_id" table "$table_id" pref "$pref_id" 2>/dev/null
+        ip -6 rule add fwmark "$mark_id/$mark_id" table "$table_id" pref "$pref_id" 2>/dev/null
         ip -6 route flush table "$table_id" 2>/dev/null
         ip -6 route add local default dev lo table "$table_id" 2>/dev/null
     fi
@@ -75,7 +81,9 @@ del_rules_for_table() {
 }
 
 del_rule_route() {
+    ip -4 rule del fwmark "$mark_id/$mark_id" table "$table_id" 2>/dev/null
     ip -4 rule del fwmark "$mark_id" table "$table_id" 2>/dev/null
+    ip -6 rule del fwmark "$mark_id/$mark_id" table "$table_id" 2>/dev/null
     ip -6 rule del fwmark "$mark_id" table "$table_id" 2>/dev/null
     del_rules_for_table 4
     del_rules_for_table 6

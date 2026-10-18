@@ -134,6 +134,16 @@ do_check() {
             echo "  nat/MIHOMO_DNS 未挂载"
         fi
         ip rule show 2>/dev/null | grep "lookup $table_id" || echo "  策略路由缺失"
+        # ip rule 必须带掩码（fwmark <mark>/<mark>）。无掩码时掩码为 0xffffffff，
+        # 而 MIHOMO_MARK 是 `--set-xmark`（按位或），Android netId 位会让实际 fwmark
+        # 变成 0x1xxxx|mark，两者永远匹配不上 -> 流量不代理。
+        # 注意：ip rule 输出的是十六进制（mark_id=2024 -> 0x7e8），需转换后比对。
+        _mark_hex=$(printf '0x%x' "$mark_id")
+        if ip rule show 2>/dev/null | grep -q "fwmark ${_mark_hex}/${_mark_hex}"; then
+            echo "  策略路由掩码正确 (fwmark ${_mark_hex}/${_mark_hex})"
+        else
+            echo "  ⚠ 策略路由掩码不正确，应重新执行: $scripts_dir/mihomo.iptables enable"
+        fi
     else
         _dev=$(config_get "$runtime_config" device)
         [ -n "$_dev" ] || _dev="$tun_device"
