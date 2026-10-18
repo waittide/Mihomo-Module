@@ -3,9 +3,9 @@
 #
 #   start | stop | restart | status        启停内核（并同步防火墙）
 #   check | t                            一键诊断
-#   switch <tproxy|tun>                  切换网络模式（会重启）
-#   toggle <on|off>                      临时启用/停用（不动 settings.ini）
-#   mode <blacklist|whitelist|off>       切换分流模式
+#   switch <tproxy|tun>                  切换网络模式（改 config.yaml 后重启）
+#   toggle <on|off>                      临时启用/停用
+#   mode <blacklist|whitelist|off>       切换分流模式（仅 TPROXY 模式有效）
 #   resolve-uid                          重新解析 package.list.cfg 的 uid
 #   config-test                          单独校验用户配置
 #   dashboard [目录]                     下载 zashboard 到 core/ui
@@ -18,7 +18,6 @@ scripts_dir="${0%/*}"
 CTL_API() {
     _ctl=$(effective_controller)
     _secret=$(config_get "$user_config" secret)
-    [ -n "$_secret" ] || _secret=$(config_get "$runtime_config" secret)
     echo "${_ctl}|${_secret}"
 }
 
@@ -63,6 +62,7 @@ reload_config() {
 
 do_start() {
     "${scripts_dir}/mihomo.service" start || return 1
+    load_settings
     "${scripts_dir}/mihomo.iptables" enable || return 1
     return 0
 }
@@ -76,13 +76,14 @@ do_stop() {
 # 重启内核。tproxy 模式下不拆防火墙（apply_rules 本身幂等），
 # 避免拆/建之间的几秒空窗与 xtables 锁竞争。
 do_restart() {
+    # 必须走 service 的 restart（一次取锁内完成 stop+start）。
+    # 拆成 do_stop; do_start 会连续取两次锁，中间窗口允许另一个 restart 插进来，
+    # 曾被热重载与手动重启同时触发时搞出两个内核实例。
+    "${scripts_dir}/mihomo.service" restart || return 1
     load_settings
-    if [ "$network_mode" = "tproxy" ]; then
-        "${scripts_dir}/mihomo.service" restart || return 1
-        "${scripts_dir}/mihomo.iptables" enable || return 1
-    else
-        do_stop; do_start
-    fi
+    # TUN 模式下 iptables enable 会走 flush 分支，把上一次 TPROXY 模式留下的
+    # 规则/策略路由清掉 —— 否则切到 TUN 后流量仍被劫持回 lo，应用全 000。
+    "${scripts_dir}/mihomo.iptables" enable || return 1
     return 0
 }
 
@@ -107,7 +108,12 @@ do_check() {
     else
         echo "缺少用户配置: $user_config"
     fi
-    [ -f "$runtime_config" ] && echo "运行时配置: $runtime_config"
+    if [ "$network_mode" = "tproxy" ] && [ -f "$runtime_config" ]; then
+        echo "运行时副本: $runtime_config（已去掉 tun 段，内核实际跑它）"
+        "$bin_path" -d "$core_dir" -t -f "$runtime_config" >/dev/null 2>&1 \
+            && echo "  运行时副本校验 OK" \
+            || echo "  运行时副本校验失败"
+    fi
     echo
     echo "=== 4. 端口 ==="
     _ctl=$(effective_controller)
@@ -145,15 +151,24 @@ do_check() {
             echo "  ⚠ 策略路由掩码不正确，应重新执行: $scripts_dir/mihomo.iptables enable"
         fi
     else
-        _dev=$(config_get "$runtime_config" device)
-        [ -n "$_dev" ] || _dev="$tun_device"
+        _dev=$(config_sub_get "$user_config" tun device)
+        [ -n "$_dev" ] || _dev="Meta"
         ip -o link show "$_dev" >/dev/null 2>&1 \
             && echo "  TUN 网卡 $_dev 存在" || echo "  TUN 网卡 $_dev 不存在"
+        echo "  （TUN 模式下网卡/路由/规则由内核自己维护，模块不写 iptables）"
     fi
     echo
     echo "=== 6. 分流 ==="
-    load_packages
-    echo "  mode: $proxy_mode  条目: ${#packages_list[@]}"
+    if [ "$network_mode" = "tproxy" ]; then
+        load_packages
+        echo "  mode: $proxy_mode  条目: ${#packages_list[@]}"
+    else
+        echo "  TUN 模式：按应用分流看 config.yaml 的 tun.include-package / exclude-package"
+        for _k in include-package exclude-package; do
+            _v=$(config_sub_get "$user_config" tun "$_k")
+            [ -n "$_v" ] && echo "  ${_k}: $_v"
+        done
+    fi
     echo
     echo "=== 7. 最近日志 ==="
     tail -15 "$log_file" 2>/dev/null
@@ -166,19 +181,18 @@ case "$1" in
     status)   "${scripts_dir}/mihomo.service" status ;;
     check|t)  do_check ;;
     switch)
+        # 只读：报告配置现在是哪种模式，不改写 config.yaml。
+        # 模式完全由用户的 config.yaml 决定（tun.enable 或 tproxy-port），
+        # 模块不替用户改配置。
         load_settings
-        case "$2" in
-            tproxy|tun) ;;
-            *) echo "用法: $0 switch <tproxy|tun>"; exit 1 ;;
-        esac
-        if grep -q '^network_mode=' "$settings_file" 2>/dev/null; then
-            sed -i "s/^network_mode=.*/network_mode=$2/" "$settings_file"
-        else
-            echo "network_mode=$2" >> "$settings_file"
-        fi
-        echo "已切换为 $2，重启中..."
-        do_stop; load_settings; do_start &&
-            echo "完成。当前模式: $network_mode"
+        echo "当前模式: ${network_mode:-未确定}"
+        echo ""
+        echo "切换方式（由你改配置，模块不代改）:"
+        echo "  用 TUN     : 保留 tun: 段并设 enable: true，删掉 tproxy-port"
+        echo "  用 TPROXY  : 删掉 tun: 段（或设 enable: false），加 tproxy-port: 7893"
+        echo "             并把 dns.listen 设成固定端口（如 listen: 0.0.0.0:53）"
+        echo ""
+        echo "改完执行: $0 restart"
         ;;
     toggle)
         case "$2" in

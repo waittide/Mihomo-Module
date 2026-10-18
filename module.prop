@@ -1,6 +1,6 @@
 id=mihomo_module
 name=Mihomo
-version=v1.1.0
-versionCode=2
+version=v1.2.0
+versionCode=3
 author=waittide
-description=轻量 mihomo 模块：不改写你的 config.yaml，安装时可选 TPROXY / TUN，支持按应用分流，内置 zashboard 面板（点「执行」按钮直达）。内核版本见 bin/mihomo。
+description=轻量 mihomo 模块：config.yaml 是唯一配置源，模块不生成运行时配置、不改写你的文件；TPROXY / TUN 二选一（同时写会报错）；支持按应用分流；内置 zashboard 面板（点「执行」按钮直达）。内核版本见 bin/mihomo。

@@ -14,19 +14,12 @@ if [ -x "${SCRIPTS}/mihomo.service" ]; then
 fi
 
 # 兜底：按 pid 文件 / 进程名清理
-for _pf in "${DATA_DIR}/core/mihomo.watch.pid" "${DATA_DIR}/core/mihomo.pid"; do
+for _pf in "${DATA_DIR}/core/mihomo.pid"; do
     [ -f "$_pf" ] && kill "$(cat "$_pf" 2>/dev/null)" 2>/dev/null && rm -f "$_pf"
 done
 
-# 清理残留的 ip rule / ip route（mark/table 可能被用户在 settings.ini 改过，
-# 所以先读配置；读不到就按默认值兜底）
+# 清理残留的 ip rule / ip route（mark/table 现在是模块内部固定值 2024）
 _mark=2024; _table=2024
-if [ -f "${DATA_DIR}/config/settings.ini" ]; then
-    _m=$(sed -n 's/^mark_id=//p' "${DATA_DIR}/config/settings.ini" | head -1)
-    _t=$(sed -n 's/^table_id=//p' "${DATA_DIR}/config/settings.ini" | head -1)
-    [ -n "$_m" ] && _mark=$_m
-    [ -n "$_t" ] && _table=$_t
-fi
 ip -4 rule show 2>/dev/null | awk -v t="$_table" '
     { for (i = 1; i < NF; i++) if ($i == "lookup" && $(i + 1) == t) { print; next } }' |
 while read -r _line; do

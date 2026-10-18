@@ -66,193 +66,6 @@ stage_binary() {
     return 1
 }
 
-# ---------------------------------------------------------------- 能力探测
-
-# TPROXY: 能不能建 TPROXY 规则
-probe_tproxy() {
-    probe_tproxy_reason=""
-    if ! has_cmd iptables; then
-        probe_tproxy_reason="系统缺少 iptables"
-        return 1
-    fi
-    if ! iptables -w 100 -t mangle -N MIHOMO_PROBE >/dev/null 2>&1; then
-        probe_tproxy_reason="iptables 无法创建 mangle 链（内核可能未加载 xt_TPROXY/xt_mangle）"
-        return 1
-    fi
-    if ! iptables -w 100 -t mangle -A MIHOMO_PROBE -p tcp -j TPROXY \
-            --on-port 1 --tproxy-mark 0x1/0x1 >/dev/null 2>&1; then
-        probe_tproxy_reason="内核不支持 TPROXY 目标（缺少 xt_TPROXY 模块）"
-        iptables -w 100 -t mangle -F MIHOMO_PROBE >/dev/null 2>&1
-        iptables -w 100 -t mangle -X MIHOMO_PROBE >/dev/null 2>&1
-        return 1
-    fi
-    iptables -w 100 -t mangle -F MIHOMO_PROBE >/dev/null 2>&1
-    iptables -w 100 -t mangle -X MIHOMO_PROBE >/dev/null 2>&1
-
-    if ! ip -4 rule show >/dev/null 2>&1 || ! ip -4 route show table 1 >/dev/null 2>&1; then
-        probe_tproxy_reason="系统缺少 ip 命令，无法建立策略路由"
-        return 1
-    fi
-    return 0
-}
-
-# TUN: 真的有 /dev/tun 并且内核能把网卡拉起来
-probe_tun() {
-    probe_tun_reason=""
-    if [ ! -e /dev/net/tun ] && [ ! -e /dev/tun ]; then
-        probe_tun_reason="设备没有 /dev/tun 或 /dev/net/tun（内核未开启 TUN 支持）"
-        return 1
-    fi
-
-    _bin="$MODPATH/bin/mihomo"
-    if [ ! -x "$_bin" ]; then
-        # 没有内核就没法真启探测，只能退回静态判断
-        ui_print_line "未携带内核，TUN 仅做静态判断（/dev/tun 存在）"
-        return 0
-    fi
-
-    _probe_dir="$TMPDIR/mihomo_probe"
-    mkdir -p "$_probe_dir"
-    cat > "$_probe_dir/probe.yaml" <<EOF
-log-level: silent
-tun:
-  enable: true
-  stack: mixed
-  device: mihomo_probe
-  mtu: 1500
-  auto-route: false
-  auto-detect-interface: false
-EOF
-
-    ( "$_bin" -d "$_probe_dir" -f "$_probe_dir/probe.yaml" > "$_probe_dir/probe.log" 2>&1 & echo $! > "$_probe_dir/probe.pid" )
-
-    _i=0
-    _ok=""
-    while [ $_i -lt 20 ]; do
-        sleep 0.3
-        if ip -o link show mihomo_probe >/dev/null 2>&1; then
-            _ok="1"
-            break
-        fi
-        _i=$((_i + 1))
-    done
-
-    if [ -f "$_probe_dir/probe.pid" ]; then
-        kill "$(cat "$_probe_dir/probe.pid")" 2>/dev/null
-        sleep 0.3
-        kill -9 "$(cat "$_probe_dir/probe.pid")" 2>/dev/null
-    fi
-
-    if [ -z "$_ok" ]; then
-        probe_tun_reason="TUN 网卡创建失败: $(grep -iE 'tun|error' "$_probe_dir/probe.log" 2>/dev/null | tail -2 | tr '\n' ' ')"
-        [ -n "$probe_tun_reason" ] || probe_tun_reason="TUN 网卡创建超时"
-        rm -rf "$_probe_dir"
-        return 1
-    fi
-
-    rm -rf "$_probe_dir"
-    ui_print_line "TUN 探测通过（成功创建 mihomo_probe 网卡）"
-    return 0
-}
-
-# ---------------------------------------------------------------- 交互选择
-
-wait_key() {
-    # $1 = 超时秒数；输出 UP / DOWN / TIMEOUT
-    # 用常驻 getevent -l 收集事件再轮询：逐个 `getevent -lc 1` 在这类设备上
-    # 会因为要枚举输入设备而漏掉按键（实测常常读不到），常驻流才稳定。
-    _ev="${TMPDIR:-/tmp}/mihomo_key.$$"
-    rm -f "$_ev"
-    getevent -l > "$_ev" 2>/dev/null &
-    _gpid=$!
-    _start=$(date +%s)
-    _ret=""
-    while true; do
-        if grep -q KEY_VOLUMEUP "$_ev" 2>/dev/null; then
-            _ret="UP"
-            break
-        fi
-        if grep -q KEY_VOLUMEDOWN "$_ev" 2>/dev/null; then
-            _ret="DOWN"
-            break
-        fi
-        if [ $(( $(date +%s) - _start )) -ge "$1" ]; then
-            _ret="TIMEOUT"
-            break
-        fi
-        sleep 0.2
-    done
-    kill "$_gpid" 2>/dev/null
-    wait "$_gpid" 2>/dev/null
-    rm -f "$_ev"
-    echo "$_ret"
-}
-
-select_network_mode() {
-    tproxy_ok=""
-    tun_ok=""
-    probe_tproxy && tproxy_ok="1"
-    probe_tun && tun_ok="1"
-
-    ui_print ""
-    ui_print "*******************************"
-    ui_print "  选择网络模式"
-    ui_print "*******************************"
-
-    if [ -n "$tproxy_ok" ]; then
-        ui_print "  [音量+] TPROXY  (推荐，当前可用)"
-    else
-        ui_print "  [音量+] TPROXY  不可用"
-        ui_print "          原因: ${probe_tproxy_reason}"
-    fi
-
-    if [ -n "$tun_ok" ]; then
-        ui_print "  [音量-] TUN"
-    else
-        ui_print "  [音量-] TUN     不可用"
-        ui_print "          原因: ${probe_tun_reason}"
-    fi
-    ui_print "  (10 秒无操作 -> 默认 TPROXY)"
-    ui_print ""
-
-    selected=""
-    if [ -z "$tproxy_ok" ] && [ -z "$tun_ok" ]; then
-        ui_print "! 两种模式均不可用，模块将安装但不启动内核"
-        ui_print "! TPROXY: ${probe_tproxy_reason}"
-        ui_print "! TUN    : ${probe_tun_reason}"
-        selected=""
-        return 0
-    fi
-
-    if [ -z "$tproxy_ok" ]; then
-        ui_print "! 仅有 TUN 可用，自动选择 TUN"
-        selected="tun"
-        return 0
-    fi
-
-    _key=$(wait_key 10 2>/dev/null)
-    # 清掉按键事件缓冲
-    ui_print_line "按键: ${_key}"
-
-    case "$_key" in
-        DOWN)
-            if [ -n "$tun_ok" ]; then
-                selected="tun"
-            else
-                ui_print "! 按键无效：TUN 不可用，改用 TPROXY"
-                selected="tproxy"
-            fi
-            ;;
-        UP)
-            selected="tproxy"
-            ;;
-        *)
-            selected="tproxy"
-            ;;
-    esac
-    ui_print_line "已选择: ${selected}"
-}
-
 # ---------------------------------------------------------------- 安装
 
 install_data_dir() {
@@ -296,37 +109,17 @@ install_data_dir() {
         cp -f "$MODPATH/config/package.list.cfg" "$data_dir/config/package.list.cfg" 2>/dev/null
     fi
 
-    # settings.ini：保留用户已有项，仅更新 network_mode
-    if [ ! -f "$data_dir/config/settings.ini" ]; then
-        cp -f "$MODPATH/config/settings.ini" "$data_dir/config/settings.ini" 2>/dev/null
-        if grep -q '^network_mode=' "$data_dir/config/settings.ini" 2>/dev/null; then
-            sed -i "s/^network_mode=.*/network_mode=${selected}/" "$data_dir/config/settings.ini"
-        else
-            echo "network_mode=${selected}" >> "$data_dir/config/settings.ini"
-        fi
-    else
-        if grep -q '^network_mode=' "$data_dir/config/settings.ini" 2>/dev/null; then
-            sed -i "s/^network_mode=.*/network_mode=${selected}/" "$data_dir/config/settings.ini"
-        else
-            echo "network_mode=${selected}" >> "$data_dir/config/settings.ini"
-        fi
-        ui_print_line "已更新 network_mode=${selected:-未选择}"
-    fi
+
 
     chmod 0755 "$data_dir" "$data_dir/bin" "$data_dir/core" "$data_dir/config" 2>/dev/null
-    chmod 0644 "$data_dir/config/"*.cfg "$data_dir/config/"*.ini 2>/dev/null
+    chmod 0644 "$data_dir/config/"*.cfg 2>/dev/null
     chmod 0600 "$data_dir/config/config.yaml" 2>/dev/null
     chown -R 0:0 "$data_dir" 2>/dev/null
 
-    # 记录安装时探测结果，供 action.sh 展示
+    # 记录安装信息（不含探测结果，安装时不再探测）
     cat > "$data_dir/core/install_info" <<EOF
 install_time=$(date '+%Y-%m-%d %H:%M:%S')
 arch=${target_arch}
-network_mode=${selected}
-tproxy_ok=${tproxy_ok:-0}
-tproxy_reason=${probe_tproxy_reason}
-tun_ok=${tun_ok:-0}
-tun_reason=${probe_tun_reason}
 EOF
 
     # 安装包里的大文件已经落到 /data/adb/mihomo，模块目录只需保留脚本
@@ -361,17 +154,20 @@ check_env
 check_last_install
 extract_files
 stage_binary
-select_network_mode
 install_data_dir
 set_module_perms
 
 ui_print ""
 ui_print_line "安装完成"
 ui_print_line "数据目录: /data/adb/mihomo"
-ui_print_line "用户配置: /data/adb/mihomo/config/config.yaml"
-ui_print_line "网络模式: ${selected:-未选择（不会启动）}"
+ui_print_line "配置文件: /data/adb/mihomo/config/config.yaml"
 ui_print ""
-ui_print "重启设备后自动启动。命令行可用:"
+ui_print "配置决定运行模式，二选一（不能同时写）："
+ui_print "  TUN    : tun: {enable: true}   —— 网卡/路由/规则全部由内核自建"
+ui_print "  TPROXY : tproxy-port: 7893     —— 还需 dns: {listen: 0.0.0.0:53}"
+ui_print "                                   enhanced-mode 必须是 redir-host"
+ui_print ""
+ui_print "改完配置执行一次重启生效:"
+ui_print "  /data/adb/modules/mihomo_module/scripts/mihomo.tool restart"
+ui_print "重启设备后会自动启动。诊断:"
 ui_print "  /data/adb/modules/mihomo_module/scripts/mihomo.tool check"
-ui_print "（首次安装后会重启生效；若在重启前调试，可用:"
-ui_print "  sh /data/adb/modules_update/mihomo_module/scripts/mihomo.tool start）"

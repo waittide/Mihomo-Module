@@ -59,19 +59,13 @@ if [ ! -f "$UI_DIR/index.html" ]; then
     "$TOOL" dashboard >> "$LOG" 2>&1
 fi
 
-# ---- 3. 让内核知道面板目录（改了 external-ui 需要重启内核）----
-RUNTIME="$DATA_DIR/core/config.yaml"
-if [ -f "$UI_DIR/index.html" ]; then
-    if ! grep -q "^external-ui: *${UI_DIR}\$" "$RUNTIME" 2>/dev/null; then
-        say "配置 external-ui 并重启内核 ..."
-        "$TOOL" restart >> "$LOG" 2>&1
-        sleep 2
-    fi
-else
-    say "web 面板不可用（下载失败），可稍后重试或在网络好的环境手动部署。"
-    say "手动部署：unzip dist.zip -d $UI_DIR"
-    sleep 5
-    exit 1
+# ---- 3. 面板目录通过 config.yaml 的 external-ui 指定 ----
+# 面板必须在 $DATA_DIR/core 下（内核以 -d core 运行），使 external-ui: ui 生效。
+# 新安装已经把 zashboard 部署到 core/ui，install 时也会自动写入 external-ui: ui。
+if ! grep -q '^external-ui:' "$DATA_DIR/config/config.yaml" 2>/dev/null; then
+    say "配置里未设置 external-ui，面板可能无法通过 /ui/ 访问。"
+    say "在 $DATA_DIR/config/config.yaml 里加一行: external-ui: ui"
+    sleep 2
 fi
 
 # ---- 4. 拼 URL 并打开 ----

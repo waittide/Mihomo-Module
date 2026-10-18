@@ -27,15 +27,4 @@ MODDIR="${0%/*}"
     fi
 
     "${MODDIR}/scripts/mihomo.tool" start >> /data/adb/mihomo/core/service.log 2>&1
-
-    # 配置变更守护（改完 config.yaml / settings.ini / package.list.cfg 自动重启内核）
-    . "${MODDIR}/scripts/mihomo.settings.sh"
-    load_settings
-    if [ "$config_watch" = "true" ] && [ -n "$busybox" ] && [ -x "$busybox" ]; then
-        if [ -f "${core_dir}/mihomo.watch.pid" ]; then
-            kill "$(cat "${core_dir}/mihomo.watch.pid" 2>/dev/null)" 2>/dev/null
-            rm -f "${core_dir}/mihomo.watch.pid"
-        fi
-        setsid "$busybox" sh "${MODDIR}/scripts/mihomo.watch" >/dev/null 2>&1 &
-    fi
 ) &

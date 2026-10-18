@@ -1,19 +1,118 @@
 #!/system/bin/sh
 # 内核启停控制：mihomo.service start|stop|restart|status
-# 只负责「生成运行时配置 + 启动/停止内核」，防火墙规则由 mihomo.iptables 负责。
+#
+# 只做一件事：用用户自己的 ${user_config} 启动/停止 mihomo。
+# 不生成配置副本、不注入任何键——配置完全由 config.yaml 决定。
+# 防火墙规则只对 TPROXY 模式生效，由 mihomo.iptables 负责（由 mihomo.tool 调用）。
 
 scripts_dir="${0%/*}"
 . "${scripts_dir}/mihomo.settings.sh"
-. "${scripts_dir}/mihomo.config.sh"
 
-start_core() {
-    load_settings
-
-    if [ -z "$network_mode" ]; then
-        set_error "未选择网络模式（TUN/TPROXY 均不可用），请重新安装模块或修改 $settings_file"
+# 启动前检查配置里该有的键是否齐全，缺了直接报错（不自动补，见 README）
+check_config() {
+    if [ ! -f "$user_config" ]; then
+        set_error "找不到配置文件 $user_config"
         return 1
     fi
 
+    if [ -z "$network_mode" ]; then
+        set_error "配置里既没有 tun.enable: true，也没有 tproxy-port，无法确定运行模式。
+请在 $user_config 里二选一：
+  - 加 tun: 段并设置 enable: true（TUN 模式，内核自己建网卡和路由）
+  - 或用 tproxy-port: 7893（TPROXY 模式，需要 dns.listen 一起配好）"
+        return 1
+    fi
+
+    if [ "$config_conflict" = "1" ]; then
+        set_error "配置冲突：同时存在 tproxy-port 与 tun.enable: true。
+这两者不能同时启用——TUN 的 auto-route 会把默认路由指向 TUN 网卡，而 TPROXY
+的 mark 又把包抢回 lo，两者互相喂包会让流量全部不通（实测 http=000）。
+请二选一（模块不会替你改配置）：
+  - TPROXY：删掉整个 tun: 段，保留顶层 tproxy-port
+  - TUN    ：删掉顶层 tproxy-port，保留 tun: 段并 enable: true
+当前文件：$user_config"
+        return 1
+    fi
+
+    if [ "$network_mode" = "tproxy" ]; then
+        if [ -z "$eff_tproxy_port" ]; then
+            set_error "TPROXY 模式缺少 tproxy-port"
+            return 1
+        fi
+        if [ -z "$dns_port" ]; then
+            set_error "TPROXY 模式缺少 dns.listen，DNS 不会被劫持，所有应用都会解析失败。
+请在 $user_config 的 dns: 段里加一行（端口可自选）：
+  dns:
+    listen: 0.0.0.0:1053
+"
+            return 1
+        fi
+        # TPROXY + fake-ip 不兼容：198.18.0.0/16 的包会被内核判为 local 直接放行，
+        # 永远进不了 tproxy，表现为「能解析但连不上」。
+        _em=$(config_sub_get "$user_config" dns enhanced-mode)
+        if [ "$_em" = "fake-ip" ]; then
+            log_msg "警告: TPROXY 模式配 fake-ip 无法工作（198.18.0.0/16 走 local 路由被内核放行），请改成 redir-host"
+        fi
+    fi
+    return 0
+}
+
+# 串行化：手动 restart、action 按钮可能同时触发。无串行化时会同时
+# 启动多个内核实例（后起的因端口/网卡已被占用而「启动后立即退出」）。
+#
+# 设备实测（HarmonyOS 4.2 / busybox 1.36）：
+#   - `exec 9>file` + `busybox flock -n 9` → "Bad file descriptor"（拿不到 shell 的 fd）
+#   - `mkdir` 做锁完全不可用：并发 5 个进程全部成功（2-5 次都出现过），不可作为锁
+#   - `ln -s` 才是原子的：并发 5 个只有 1 个成功
+# 所以用符号链接做锁，内容是被锁进程的 pid，持有者已死时可自动清理。
+lock_path() { echo "${core_dir}/.service.lock"; }
+
+_owner_alive() {
+    _o=$(readlink "$(lock_path)" 2>/dev/null)
+    [ -n "$_o" ] && kill -0 "$_o" 2>/dev/null
+}
+
+acquire_lock() {
+    _lock=$(lock_path)
+    mkdir -p "$core_dir" 2>/dev/null
+    # 超时必须按墙钟算，不能按循环次数：设备上 `sleep 0.5` 在有后台子进程时
+    # 会被信号打断而立即返回，实测 121 次迭代只花了 1.9 秒，用计数会让每个
+    # 等待者都误判“超时”并强制抢锁 —— 反而把串行化彻底破坏。
+    _lock_start=$(date +%s)
+    while ! ln -s "$$" "$_lock" 2>/dev/null; do
+        _owner=$(readlink "$_lock" 2>/dev/null)
+        # 持有者已不存在（崩溃/被杀）→ 清掉死锁继续抢
+        if [ -z "$_owner" ] || ! kill -0 "$_owner" 2>/dev/null; then
+            rm -f "$_lock"
+            continue
+        fi
+        _now=$(date +%s)
+        if [ $((_now - _lock_start)) -gt 120 ]; then
+            log_msg "等待启停锁超时 120s（持有者 pid ${_owner}），强制接管"
+            rm -f "$_lock"
+            _lock_start=$_now
+            continue
+        fi
+        sleep 1
+    done
+    return 0
+}
+
+release_lock() {
+    [ "$(readlink "$(lock_path)" 2>/dev/null)" = "$$" ] && rm -f "$(lock_path)"
+    return 0
+}
+
+start_core() {
+    load_settings
+    acquire_lock
+    _start_core_locked
+    _rc=$?
+    release_lock
+    return $_rc
+}
+
+_start_core_locked() {
     if [ ! -x "$bin_path" ]; then
         set_error "找不到可执行内核: $bin_path（请把 mihomo 二进制放到该路径并 chmod 0755）"
         return 1
@@ -27,20 +126,22 @@ start_core() {
     mkdir -p "$core_dir"
     clear_error
 
-    # 读取按应用分流清单（tun 模式要把名单写进 tun 段，必须先于生成配置）
-    . "${scripts_dir}/mihomo.packages.sh"
-    load_packages || return 1
+    check_config || return 1
 
-    # 用户可能手改了设置里的端口，重新生成前先确认配置能过
-    generate_runtime_config || return 1
+    # TUN 模式的按应用分流由 mihomo 的 tun.include-package/exclude-package 负责，
+    # 用户直接写在 config.yaml 里，模块不介入；TPROXY 模式才需要解析 uid。
+    if [ "$network_mode" = "tproxy" ]; then
+        . "${scripts_dir}/mihomo.packages.sh"
+        load_packages || return 1
+    fi
 
-    log_msg "启动内核: mode=${network_mode} bin=${bin_path}"
+    log_msg "启动内核: mode=${network_mode} bin=${bin_path} config=${user_config}"
 
     if [ -n "$busybox" ] && [ -x "$busybox" ]; then
         nohup "$busybox" setuidgid "$core_group" "$bin_path" \
-            -d "$core_dir" -f "$runtime_config" >> "$log_file" 2>&1 &
+            -d "$core_dir" -f "$user_config" >> "$log_file" 2>&1 &
     else
-        nohup "$bin_path" -d "$core_dir" -f "$runtime_config" >> "$log_file" 2>&1 &
+        nohup "$bin_path" -d "$core_dir" -f "$_run_cfg" >> "$log_file" 2>&1 &
     fi
     _pid=$!
     echo "$_pid" > "$pid_file"
@@ -53,56 +154,86 @@ start_core() {
         sleep 0.5
         if ! kill -0 "$_pid" 2>/dev/null; then
             echo "" > "$pid_file"
-            set_error "内核启动后立即退出: $(tail -3 "$log_file" | tr '\n' ' ')"
+            set_error "内核启动后立即退出: $(tail -5 "$log_file" | tr '\n' ' ')"
             return 1
         fi
         port_listening "$_port" && break
         _i=$((_i + 1))
     done
 
-    if ! port_listening "$_port"; then
-        log_msg "警告: 控制器 ${_ctl} 尚未监听，请稍后用 mihomo.tool status 复查"
+    if kill -0 "$_pid" 2>/dev/null; then
+        log_msg "内核已启动 (pid ${_pid}, mode=${network_mode})"
+        return 0
     fi
 
-    log_msg "内核已启动 pid=${_pid} mode=${network_mode}"
-    return 0
+    echo "" > "$pid_file"
+    set_error "内核启动失败: $(tail -5 "$log_file" | tr '\n' ' ')"
+    return 1
 }
 
 stop_core() {
     load_settings
-    _pid=$(clash_pid)
-    if [ -z "$_pid" ]; then
-        rm -f "$pid_file"
-        log_msg "内核未运行"
+    acquire_lock
+    _stop_core_locked
+    release_lock
+    return 0
+}
+
+restart_core() {
+    load_settings
+    acquire_lock
+    _stop_core_locked
+    _start_core_locked
+    _rc=$?
+    release_lock
+    return $_rc
+}
+
+_stop_core_locked() {
+    # 按 cmdline 扫描而不是只看 pidfile：pidfile 丢失时旧进程仍会占着端口
+    _pids=$(all_mihomo_pids)
+    if [ -z "$_pids" ]; then
+        echo "" > "$pid_file" 2>/dev/null
         return 0
     fi
-    kill "$_pid" 2>/dev/null
+    log_msg "停止内核 (pid $(echo $_pids | tr '\n' ' '))"
+    for _pid in $_pids; do
+        kill "$_pid" 2>/dev/null
+    done
     _i=0
-    while [ $_i -lt 20 ] && [ -d "/proc/$_pid" ]; do
-        sleep 0.5
+    while [ $_i -lt 20 ]; do
+        _alive=""
+        for _pid in $_pids; do
+            kill -0 "$_pid" 2>/dev/null && _alive="$_alive $_pid"
+        done
+        [ -z "$_alive" ] && break
+        sleep 0.25
         _i=$((_i + 1))
     done
-    [ -d "/proc/$_pid" ] && kill -9 "$_pid" 2>/dev/null
-    rm -f "$pid_file"
-    log_msg "内核已停止 pid=${_pid}"
+    for _pid in $_pids; do
+        kill -0 "$_pid" 2>/dev/null && kill -9 "$_pid" 2>/dev/null
+    done
+    echo "" > "$pid_file" 2>/dev/null
     return 0
 }
 
 status_core() {
     load_settings
     _pid=$(clash_pid)
-    echo "network_mode : ${network_mode:-未选择}"
-    echo "settings     : ${settings_file}"
     echo "user config  : ${user_config}"
-    echo "runtime conf : ${runtime_config}"
     echo "kernel       : ${bin_path}"
+    case "$network_mode" in
+        tun)    echo "network mode : tun（内核自建网卡/路由，模块不写 iptables）" ;;
+        tproxy) echo "network mode : tproxy（模块负责 iptables + 策略路由）" ;;
+        *)      echo "network mode : 未确定（配置里缺 tun.enable / tproxy-port）" ;;
+    esac
     if [ -n "$_pid" ]; then
         echo "status       : running (pid ${_pid})"
     else
         echo "status       : stopped"
     fi
-    echo "tproxy-port  : ${tproxy_port:-未启用}"
-    echo "dns-port     : ${dns_port:-未启用}"
+    echo "tproxy-port  : ${eff_tproxy_port:-未配置}"
+    echo "dns-port     : ${eff_dns_port:-未配置}"
     echo "controller   : $(effective_controller)"
     _err=$(get_error)
     [ -n "$_err" ] && echo "last error   : ${_err}"
@@ -112,7 +243,7 @@ status_core() {
 case "$1" in
     -s|start)   start_core ;;
     -k|stop)    stop_core ;;
-    -r|restart) stop_core; start_core ;;
+    -r|restart) restart_core ;;
     -t|status)  status_core ;;
     *)
         echo "用法: $0 {start|stop|restart|status}"

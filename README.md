@@ -1,181 +1,173 @@
 # Mihomo Module
 
-轻量的 [mihomo](https://github.com/MetaCubeX/mihomo)（Clash Meta）Magisk / KernelSU / APatch 模块。
+给 Magisk / KernelSU / APatch 用的 mihomo 透明代理模块。
 
-**核心原则：模块不改写你的 `config.yaml`。** 你写什么，内核就跑什么；模块只在运行时配置里补上容器需要的最小几段（`tun`、`external-controller`、`tproxy-port`、缺省 `dns`），你配置里已有的同名顶层键一律以你的为准。
+**核心原则：`config.yaml` 是唯一的配置来源。** 模块不生成运行时配置、不注入任何
+键、不改写你的 `config.yaml`——内核永远直接用 `-f /data/adb/mihomo/config/config.yaml`
+运行。你写什么，就跑什么。
+
+配置写错时模块**只报错不动手**：缺 `dns.listen`、`tun` 与 `tproxy-port` 同时开，
+都会直接拒绝启动并告诉你该删/该加哪一行（见「缺失配置直接报错」）。
 
 ## 特性
 
-- **不篡改用户配置**：用户配置在安装后原样保留，重装/升级不覆盖（已存在就跳过）。
-- **安装时能力探测 + 选择网络模式**：真实探测 TPROXY（mangle/TPROXY + 策略路由）和 TUN（**真启动一次内核看网卡是否创建**），不可用的模式会打印原因并拒绝选择。
-- **按应用分流**：`package.list.cfg` 的黑/白名单，TPROXY 下翻译成 `-m owner --uid-owner` 规则，TUN 下翻译成 `include-package` / `exclude-package`。
-- **配置变更自动重载**：改动 `config.yaml` / `settings.ini` / `package.list.cfg` 后自动重启内核。
-- **无 ipset 依赖**：本模块只用 `iptables -m owner`，因为很多设备（含鸿蒙）没有 `ipset` / `-m set`。
-- **一键诊断**：`mihomo.tool check`。
-- **内置 web 面板**：安装包带 zashboard，点模块管理器里的「操作」/「执行」按钮直接打开面板；终端窗口一闪而过看不到的东西全写到 `core/action.log`。
+- **单一配置源**：没有 `settings.ini`、没有运行时配置生成、没有模板替换、没有
+  文件监听。改完 `config.yaml` 后执行一次 `mihomo.tool restart` 即可。
+- **两种运行模式，由配置自己表达**：
+  - 顶层 `tproxy-port` → **TPROXY**（支持 UDP 全代理）。内核只提供端口，规则由
+    模块建立：mangle `TPROXY` + `MARK`、nat DNS 重定向、`ip rule` 策略路由。
+  - 只有 `tun.enable: true`、没有 `tproxy-port` → **TUN**。网卡、路由、iptables
+    规则全部由内核自建，模块一个规则都不写。
+  - 两者**同时存在 → 拒绝启动并报错**。实测两者同开会互相喂包——TUN 的
+    `auto-route` 把默认路由指向 TUN 网卡，TPROXY 的 mark 又把包抢回 `lo`——结果
+    是 `http=000`。模块不替你猜，直接告诉你删掉哪个。
+- **模式切换会自动清理残留规则**：从 TPROXY 切到 TUN 时，`mihomo.iptables enable`
+  走 flush 分支把 mangle 链、nat 链、`ip rule`/`ip route` 全部拆掉。否则旧的
+  TPROXY 规则会把 TUN 的流量劫持回 `lo`，而 `status` 却显示「TUN 模式，模块不写
+  iptables」，极难排查。
+- **缺失配置直接报错，不猜不补**：TPROXY 模式缺 `dns.listen` 时拒绝启动并给出
+  该补的那一行（`listen` 缺失会让 53 被劫持到不存在的端口，表现为"全部应用上
+  不了网但内核日志正常"）。
+- **内置 web 面板**：安装包自带 zashboard 到 `core/ui`，`external-ui: ui` 由你写在
+  配置里。管理器里点「执行」按钮会启动内核并用浏览器打开 `http://127.0.0.1:9090/ui/`
+  （不带 query 参数，后端地址和密码在面板里自己填）。
+- **action 日志落盘**：管理器终端窗口一闪而过看不清时，看
+  `/data/adb/mihomo/core/action.log`。
 
 ## 安装
 
-```sh
-# Magisk / KernelSU：管理器里刷入 zip
-# APatch：
-apd module install /path/to/Mihomo-v1.1.0.zip
-```
-
-安装过程中：
-
-1. 检查架构（arm64-v8a / armeabi-v7a / x86_64）与 busybox。
-2. 探测 TPROXY 与 TUN 可用性。
-3. 用音量键选择网络模式（**默认 TPROXY**；10 秒无操作按默认值）：
-   - **音量上 = TPROXY**
-   - **音量下 = TUN**
-   - 不可用的模式会显示原因，按对应的键会被忽略。
-4. 释放文件到 `/data/adb/mihomo/`。
-
-首次安装后**需要重启一次**才生效（模块目录里的 `update` 标记为 APatch 的待生效状态）。
+1. 在管理器里刷入 zip。
+2. 安装只做三件事：解包、把 `bin/mihomo` 与 geo 数据放到 `/data/adb/mihomo`、
+   在 `config/` 下放一份默认 `config.yaml`（**已存在则绝不覆盖**）。
+   **不做能力探测，也不让你按音量键选模式**——模式由配置文件决定。
+3. 重启设备生效。重启前想先试可以：
+   ```sh
+   su -c 'sh /data/adb/modules/mihomo_module/scripts/mihomo.tool start'
+   ```
 
 ## 目录结构
 
 ```
 /data/adb/mihomo/
-├── bin/mihomo          # 内核（随模块打包）
-├── config/             # 你的配置，模块不会改写
-│   ├── config.yaml     # 主配置
-│   ├── settings.ini    # 模块设置（端口/模式/mark 等）
-│   └── package.list.cfg# 按应用分流清单
-└── core/               # 运行时产物
-    ├── config.yaml     # 模块生成的运行时配置（= 你的配置 + 补充段）
-    ├── mihomo.log      # 内核 + 模块日志
+├── bin/mihomo              # 内核（随安装包提供）
+├── config/
+│   ├── config.yaml         # ← 唯一配置源，内核直接读它
+│   └── package.list.cfg    # 按应用分流清单（仅 TPROXY 模式使用）
+└── core/
+    ├── ui/                 # zashboard 面板（external-ui: ui）
+    ├── mihomo.log          # 内核日志
     ├── mihomo.pid
-    ├── action.log       # 点「执行」按钮产生的日志（管理器关窗后仍可查）
-    ├── ui/              # zashboard 面板（安装包内置）
-    ├── ports.env       # 实际生效的端口
-    ├── uid.list        # 名单解析出的 uid
-    ├── last_error      # 最近一次错误
-    └── GeoIP.dat / GeoSite.dat / Country.mmdb
+    ├── action.log          # 「执行」按钮的输出
+    └── last_error          # 最近一次启动失败原因
 ```
 
-## 配置
+模块自身（`/data/adb/modules/mihomo_module/`）只放脚本，不放二进制和 geo 数据，
+升级时不会重复占空间。
 
-### `config/settings.ini`
+## 配置怎么选模式
 
-```ini
-network_mode=tproxy     # tproxy | tun
-tproxy_port=7893
-dns_port=53
-tun_device=mihomo
-tun_stack=mixed         # mixed | system | gvisor
-tun_mtu=1500
-ipv6=true
-mark_id=2024            # fwmark，策略路由用
-table_id=2024
-pref_id=5200            # ip rule 优先级
-core_group=root:net_admin
-external_controller=127.0.0.1:9090
-external_ui=            # 留空则自动用 core/ui（面板已装时）
-config_watch=true       # 配置变更自动重载
+### TPROXY（推荐，支持 UDP 全代理）
+
+```yaml
+tproxy-port: 7893
+
+dns:
+  enable: true
+  listen: 0.0.0.0:53        # ← 必须写！缺了会拒绝启动
+  enhanced-mode: redir-host # ← 不能是 fake-ip，见下
 ```
 
-> 你在 `config.yaml` 里显式写了 `external-controller` 时，以 `config.yaml` 为准。
-> `external-ui` 例外：用户配置里的值会被剥掉，改由 `settings.ini` 的 `external_ui`
-> 或自动探测到的 `core/ui` 决定（否则面板目录一变就会失效）。
+TPROXY 适合需要 UDP 全代理、或不想建 TUN 网卡的场景。模块会建立：
 
-## 点「操作」/「执行」按钮直接打开面板
+- `mangle PREROUTING → MIHOMO_TPROXY`：保留网段 RETURN，其余 `TPROXY --on-port`
+- `mangle OUTPUT → MIHOMO_MARK`：排除 root 与内核自身 gid 后打 mark
+- `nat PREROUTING/OUTPUT → MIHOMO_DNS*`：53 重定向到 `dns.listen` 的端口
+- `ip rule fwmark 0x7e8/0x7e8 table 2024` + `ip route local default dev lo table 2024`
 
-模块的 action（管理器里模块卡上的按钮）现在的行为是：
+> `fwmark` 必须带掩码。`MIHOMO_MARK` 是 `MARK --set-xmark`（按位或），Android 的
+> socket 自带 netId 位（wifi 100 → `0x10064`），实际 fwmark 是 `0x107ec`；无掩码
+> 的 `ip rule` 要求精确相等，永远匹配不上，表现为"规则有命中但流量从 wlan0 逃逸"。
 
-1. 内核没跑就先启动
-2. 面板没装就下载 zashboard 到 `core/ui`
-3. `am start -a android.intent.action.VIEW -d http://127.0.0.1:9090/ui/` 打开浏览器
-4. 管理器那个一闪而过的终端窗口里看不到的细节，全部写到
-   `/data/adb/mihomo/core/action.log`
-
-日志查看方式：
-
-```sh
-adb shell su -c 'cat /data/adb/mihomo/core/action.log'
-# 或在 Termux 里
-su -c 'less /data/adb/mihomo/core/action.log'
-```
-
-安装包里**内置了 zashboard 面板**（322 个文件 / 13 MB），装完即用，不需要联网下载。
-手动重装面板：`$S/mihomo.tool dashboard`（会校验 zip 完整性并重试）。
-页面地址：`http://127.0.0.1:9090/ui/`；如果 `config.yaml` 里设了 `secret`，
-action 会自动拼上 `?secret=<值>`。
-
-### `config/package.list.cfg`
-
-```ini
-# mode: blacklist = 名单内不走代理（其余走代理）
-# mode: whitelist = 只有名单内走代理
-mode: blacklist
-com.example.app
-10:com.example.workprofile_app   # 指定用户（10 = 工作资料）
-```
-
-默认 `mode: blacklist` + 空名单 = 全部走代理。
-
-### 端口冲突
-
-`tproxy_port` / `dns_port` 被别的程序占用时，模块不会自动改端口，只在 `mihomo.tool check` 里报出来。改 `settings.ini` 后会自动重载。
-
-## 命令
-
-所有命令都在 `/data/adb/modules/mihomo_module/scripts/` 下：
-
-```sh
-S=/data/adb/modules/mihomo_module/scripts
-
-$S/mihomo.tool start|stop|restart|status
-$S/mihomo.tool check                # 一键诊断
-$S/mihomo.tool switch tproxy|tun    # 切换网络模式（会重启）
-$S/mihomo.tool toggle on|off        # 临时启停
-$S/mihomo.tool mode blacklist|whitelist|off
-$S/mihomo.tool resolve-uid          # 重新解析名单 uid
-$S/mihomo.tool config-test          # 只校验你的 config.yaml
-$S/mihomo.tool dashboard [dir]      # 重装 zashboard 面板到 core/ui
-$S/mihomo.tool update-geo           # 删掉本地 geo 数据后重启，让内核重新下载
-```
-
-## 网络模式说明
-
-### TPROXY（默认）
-
-不需要 VPN 授权，适合大多数已 root 设备。规则：
-
-- `mangle PREROUTING → MIHOMO_TPROXY`：保留地址 RETURN，其余 TCP/UDP `TPROXY --on-port <tproxy_port>`
-- `mangle OUTPUT → MIHOMO_MARK`：先 RETURN 掉内核自身（uid 0 / gid net_admin），再按名单 MARK
-- `nat PREROUTING/OUTPUT → MIHOMO_DNS*`：把 53 端口 REDIRECT 到 `dns_port`（默认就是 53，即直接监听 53；改成别的端口时才会真正 REDIRECT）
-- `ip rule fwmark <mark_id>/<mark_id> lookup <table_id>` + `ip route add local default dev lo table <table_id>`
-
-**策略路由的 `ip rule` 必须带掩码写成 `<mark_id>/<mark_id>`。** `MIHOMO_MARK` 里用的是 `MARK --set-xmark <mark_id>/<mark_id>`，语义是「按掩码按位或写入」，而 Android 的 socket 自带 netId 标记（wifi netId=100 → `0x10064`），实际 fwmark 变成 `0x10064|0x7e8 = 0x107ec`。若 `ip rule add fwmark 0x7e8`（掩码 `0xffffffff`，要求精确相等），就永远匹配不上：包会从 wlan0 直接发出去、`MIHOMO_TPROXY` 链零命中、应用侧表现为「连不上、DNS 正常但流量不代理」。历史上这里曾写成无掩码形式，是本模块最容易复发的坑。
-
-**注意：`mihomo` 的 fake-ip 段（默认 `198.18.0.1/16`）不能算作保留地址**，否则应用解析出的 fake-ip 会被直接放行。模块已把它排除在 RETURN 列表外。
+> **TPROXY 不能配 fake-ip**：`198.18.0.0/16` 的包会被内核判为 `local` 直接放行，
+> 永远进不了 tproxy，表现为"能解析但连不上"。必须用 `redir-host`。
 
 ### TUN
 
-需要内核支持 `/dev/net/tun`。安装时模块会真启动一次内核去验证网卡能否创建。
+```yaml
+tun:
+  enable: true
+  stack: mixed
+  auto-route: true            # TUN 必需：跟随网络切换重建路由
+  auto-detect-interface: true # 出站绑定正确的物理网卡
+  dns-hijack:
+    - "any:53"
+  # auto-redirect 建议不写：它是给「不开 Android VPN、纯靠 iptables 抓流量」的场景
+  # 准备的第二层劫持，常规使用会和内核自身路由重复。
+```
 
-TUN 模式下模块不写 iptables 规则（DNAT/劫持都不需要），黑白名单通过 `tun.exclude-package` / `tun.include-package` 实现——所以列表里必须写**包名**，不能写 uid（写 `user:包名` 的条目在 TUN 模式下会被解析成包名）。
+内核自己建网卡、策略路由、nat 重定向，停止时自动清理干净。**不需要模块写任何
+iptables 规则**——但如果你刚从 TPROXY 切过来，模块会主动清掉旧的 TPROXY 规则。
+
+## `package.list.cfg`（仅 TPROXY 模式）
+
+```yaml
+mode: blacklist        # blacklist = 名单内不走代理；whitelist = 只有名单内走代理
+com.android.chrome
+10:com.tencent.mm       # 前缀 "用户id:" 可指定工作资料/多用户
+```
+
+空名单 + `blacklist` = 全部走代理（默认）。
+
+设备上没有 `ipset`/`-m set`，所以分流只能翻译成 `-m owner --uid-owner`；uid 从
+`/data/system/packages.list` 解析（`user*100000+appid`）。
+
+TUN 模式的按应用分流**不**用这个文件，直接在 `config.yaml` 里写
+`tun.include-package` / `tun.exclude-package`。
+
+## 命令
+
+```sh
+TOOL=/data/adb/modules/mihomo_module/scripts/mihomo.tool
+
+$TOOL start|stop|restart|status    # 启停（TPROXY 模式下同时同步防火墙）
+$TOOL check                        # 一键诊断（配置校验/端口/规则/分流/日志）
+$TOOL switch                       # 只读：显示当前模式 + 如何自行切换
+$TOOL toggle <on|off>              # 临时启停
+$TOOL mode <blacklist|whitelist>   # 改 package.list.cfg 的 mode
+$TOOL resolve-uid                  # 重新解析 uid
+$TOOL config-test                  # 单独校验 config.yaml
+$TOOL dashboard                    # 重新下载 zashboard 到 core/ui
+$TOOL update-geo                   # 删掉旧 geo 数据后重启（内核会重新下载）
+```
 
 ## 已知限制
 
-- **无 `ipset`**：黑白名单靠 `iptables -m owner --uid-owner`，名单很长时规则条数会变多（每条应用一条）。
-- **IPv6 DNS 无法劫持**：部分设备（如 HarmonyOS 4.2 / kernel 4.19）没有 `ip6tables -t nat` 表，模块会在日志里说明并回退到「IPv6 流量按 mihomo 的 tun/direct 处理」。
-- **`-f` 不能叠加**：mihomo 的多个 `-f` 是 last-wins（后一个文件整体替换前一个，不是深度合并），所以模块把补充段写进运行时配置的单一文件里，而不是用多个 `-f`。
-- **配置变更检测是轮询**（每 2 秒比对 md5）：比 inotify 可靠。本机实测一次保存会连发 `c/c/w` 三个事件，用 inotify 去抖很难做对（容易漏事件或重复重启）。
+- **没有 `ipset` / `-m set`**：本类设备（实测 HarmonyOS 4.2）的 iptables 缺该
+  match，busybox 也没有 ipset，所以黑白名单只能用 `-m owner`。宽带名单会变长。
+- **IPv6 可能没有 nat 表**：本机 `ip6tables -t nat` 不存在，IPv6 的 53 无法
+  REDIRECT，只能靠 TUN 的 `dns-hijack` 或 mangle TPROXY 兜。
+- **TUN 与 TPROXY 不能同时开**（见上）。
+- **mihomo 多个 `-f` 是 last-wins**，不能当覆盖层用——所以本模块坚持单文件。
+- **不监听配置变更**：改完 `config.yaml` 需要手动 `mihomo.tool restart`（或管理器里
+  点「执行」按钮）。曾实现过轮询与 `inotifyd` 两版，前者多耗电，后者在本类设备上
+  一次保存连发 `c/c/w` 三个事件、编辑器还会 rename 产生目录 `M` 事件，去抖很容易
+  做错（出现过"一次保存触发三次重启"），故移除。
 
 ## 卸载
 
-管理器里卸载即可，`/data/adb/mihomo` 用户数据默认保留。想彻底清理：
+卸载脚本会停内核、清 TPROXY 规则与策略路由，但**保留** `/data/adb/mihomo`
+（你的 `config.yaml` 在里面）。要彻底清掉：
 
 ```sh
-rm -rf /data/adb/mihomo
+su -c 'rm -rf /data/adb/mihomo'
 ```
 
-## 参考
+## 参考实现
 
-设计上参考了 [Mihomo_For_Magisk](https://github.com/icewithcola/Mihomo_For_Magisk) 与 [box_for_magisk](https://github.com/taamarin/box_for_magisk) 的实现，但**配置处理策略完全不同**：前者的 template 合并会截断用户配置（`sed -n '/^proxies:/,$p'` 只保留 `proxies:` 之后的内容），本模块不做这种事。
+- [Mihomo_For_Magisk](https://github.com/icewithcola/Mihomo_For_Magisk)：模板合并式
+  配置（用模板覆盖用户配置），本模块刻意走了相反路线。
+- [box_for_magisk](https://github.com/taamarin/box_for_magisk)：`package.list.cfg`
+  格式与安装脚本的音量键交互参考自它。
 
 ## License
 

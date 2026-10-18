@@ -1,14 +1,16 @@
 #!/system/bin/sh
 # 防火墙规则：mihomo.iptables enable|disable|status|flush
 #
-# TPROXY 模式（默认）：
-#   mangle PREROUTING  -> MIHOMO_TPROXY : 局域网/保留地址 RETURN，其余 TPROXY --on-port <tproxy_port>
-#   mangle OUTPUT      -> MIHOMO_MARK   : 内核自身/按应用名单过滤后 MARK，走策略路由转回本机
-#   nat PREROUTING     -> MIHOMO_DNS    : udp/tcp 53 REDIRECT 到 <dns_port>
-#   nat OUTPUT         -> MIHOMO_DNS_OUT: 本机查询 53 REDIRECT 到 <dns_port>
-#   ip rule fwmark <mark> table <table> + ip route local default dev lo table <table>
+# 只在 TPROXY 模式下工作（config.yaml 里有 tproxy-port 且没有 tun.enable: true）。
+# TUN 模式下内核自己建网卡、路由、nat 重定向，这里直接跳过——实测两者叠加
+# 会让流量陷入回环（http=000），所以必须互斥。
 #
-# TUN 模式：不写任何规则，交给内核的 TUN 网卡处理（DNS 由 tun 的 dns-hijack 接管）。
+# TPROXY 模式：
+#   mangle PREROUTING  -> MIHOMO_TPROXY : 局域网/保留地址 RETURN，其余 TPROXY --on-port <tproxy-port>
+#   mangle OUTPUT      -> MIHOMO_MARK   : 内核自身/按应用名单过滤后 MARK，走策略路由转回本机
+#   nat PREROUTING     -> MIHOMO_DNS    : udp/tcp 53 REDIRECT 到 <dns.listen 端口>
+#   nat OUTPUT         -> MIHOMO_DNS_OUT: 本机查询 53 REDIRECT 到 <dns.listen 端口>
+#   ip rule fwmark <mark>/<mark> table <table> + ip route local default dev lo table <table>
 
 scripts_dir="${0%/*}"
 . "${scripts_dir}/mihomo.settings.sh"
@@ -65,7 +67,7 @@ add_rule_route() {
 }
 
 # 删除所有指向本模块 table 的策略路由（按 table 而不是 mark 清）。
-# 原因：用户改过 settings.ini 的 mark_id 之后，旧 mark 的规则会残留
+# 原因：mark/table 改过之后旧规则会残留
 # （实测出现过 0x7e8 / 0x7e9 两条并存）。
 # 注意设备上的 grep 是 toybox，不支持 `\b`，这里用 awk 按字段比对。
 #   del_rules_for_table <4|6>
@@ -206,12 +208,21 @@ build_ipv6_rules() {
 
 apply_rules() {
     load_settings
-    load_packages
 
     if [ "$network_mode" != "tproxy" ]; then
-        log_msg "当前模式为 ${network_mode:-未选择}，无需 iptables 规则"
+        # 非 TPROXY 模式必须把已有规则清干净，不能只 return。
+        # 否则从 TPROXY 切到 TUN 时旧的 MIHOMO_TPROXY / ip rule 还挂着，
+        # 把 TUN 的流量又劫持回 lo -> 流量全挂（实测 http=000），
+        # 而 status 显示「TUN 模式，模块不写 iptables」，极难排查。
+        case "$network_mode" in
+            tun) log_msg "当前为 TUN 模式，内核自建网卡/路由/规则；清掉残留的 TPROXY 规则" ;;
+            *)   log_msg "未确定运行模式（配置缺 tun.enable / tproxy-port），清掉残留规则" ;;
+        esac
+        flush_rules
         return 0
     fi
+
+    load_packages
 
     iptables -w 100 -t mangle -N "$TPROXY_CHAIN" 2>/dev/null
     build_tproxy_chain
@@ -238,12 +249,20 @@ apply_rules() {
 flush_rules() {
     load_settings
 
-    ipt -t mangle -D PREROUTING -j "$TPROXY_CHAIN" 2>/dev/null
-    ipt -t mangle -D OUTPUT -j "$MARK_CHAIN" 2>/dev/null
-    ipt -t nat -D PREROUTING -j "$DNS_CHAIN" 2>/dev/null
-    ipt -t nat -D OUTPUT -j "$DNS_OUT_CHAIN" 2>/dev/null
-    ip6t -t nat -D PREROUTING -j "$DNS_CHAIN" 2>/dev/null
-    ip6t -t nat -D OUTPUT -j "$DNS_CHAIN" 2>/dev/null
+    # 用循环删，单次 -D 只删一条；反复 restart / 多次 enable 可能挂载过多次
+    _d() {
+        _i=0
+        while [ $_i -lt 20 ]; do
+            "$1" -t "$2" -D "$3" -j "$4" 2>/dev/null || break
+            _i=$((_i + 1))
+        done
+    }
+    _d ipt mangle PREROUTING "$TPROXY_CHAIN"
+    _d ipt mangle OUTPUT "$MARK_CHAIN"
+    _d ipt nat PREROUTING "$DNS_CHAIN"
+    _d ipt nat OUTPUT "$DNS_OUT_CHAIN"
+    _d ip6t nat PREROUTING "$DNS_CHAIN"
+    _d ip6t nat OUTPUT "$DNS_CHAIN"
 
     ipt -t mangle -F "$TPROXY_CHAIN" 2>/dev/null
     ipt -t mangle -X "$TPROXY_CHAIN" 2>/dev/null
