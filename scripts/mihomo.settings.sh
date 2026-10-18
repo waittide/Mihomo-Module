@@ -26,7 +26,7 @@ error_file="$core_dir/last_error"
 # network_mode: tproxy | tun | 空 = 安装时未选择（不启动）
 network_mode="tproxy"
 tproxy_port=7893
-dns_port=1053
+dns_port=53
 tun_device="mihomo"
 tun_stack="mixed"
 tun_mtu=1500
@@ -36,13 +36,14 @@ table_id=2024
 pref_id=5200
 core_group="root:net_admin"
 external_controller="127.0.0.1:9090"
+# web 面板目录；存在时自动写入运行时配置的 external-ui，供 action 按钮一键打开
 external_ui=""
 config_watch="true"
 
 load_settings() {
     network_mode="tproxy"
     tproxy_port=7893
-    dns_port=1053
+    dns_port=53
     tun_device="mihomo"
     tun_stack="mixed"
     tun_mtu=1500
@@ -55,6 +56,9 @@ load_settings() {
     external_ui=""
     config_watch="true"
     [ -f "$settings_file" ] && . "$settings_file"
+
+    # external-ui 未显式配置时，core/ui 存在就用它（安装后 action 按钮才能一键打开面板）
+    [ -n "$external_ui" ] || [ ! -d "$core_dir/ui" ] || external_ui="$core_dir/ui"
 
     core_user="${core_group%%:*}"
     core_gid="${core_group##*:}"

@@ -51,6 +51,17 @@ jobs:
           curl -fsSL -o core/Country.mmdb "$base/country.mmdb"
           ls -lh core
 
+      - name: 下载 web 面板 (zashboard)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/zashboard.zip \
+            https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip
+          rm -rf ui && mkdir -p ui
+          unzip -q /tmp/zashboard.zip -d /tmp/zz
+          if [ -d /tmp/zz/dist ]; then cp -af /tmp/zz/dist/. ui/; else cp -af /tmp/zz/. ui/; fi
+          [ -f ui/index.html ] || { echo '面板缺少 index.html'; exit 1; }
+          echo "面板文件数: $(find ui -type f | wc -l)"
+
       - name: 打包
         run: ./build.sh dist
 

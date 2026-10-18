@@ -8,3 +8,6 @@ dist/
 build/
 *.zip
 .DS_Store
+
+# web 面板（zashboard），由 CI 或 mihomo.tool dashboard 获取，不进仓库
+ui/

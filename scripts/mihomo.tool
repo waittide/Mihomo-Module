@@ -218,20 +218,46 @@ case "$1" in
         load_settings
         _dir="${2:-${core_dir}/ui}"
         mkdir -p "$_dir"
+        _zip="${core_dir}/zashboard.zip"
         echo "下载 zashboard 到 ${_dir} ..."
-        if command -v curl >/dev/null 2>&1; then
-            curl -sSL -o /tmp/zashboard.zip \
-                https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip || {
-                echo "下载失败"; exit 1; }
-        else
-            "$busybox" wget -q -O /tmp/zashboard.zip \
-                https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip || {
-                echo "下载失败"; exit 1; }
+        # 设备上直连 GitHub release 经常被截断，失败时重试一次并校验 zip 完整性
+        _ok=0
+        for _try in 1 2; do
+            echo "  第 ${_try} 次尝试 ..."
+            rm -f "$_zip"
+            if command -v curl >/dev/null 2>&1; then
+                curl -fL --retry 3 --connect-timeout 15 -o "$_zip" \
+                    https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip || { _ok=0; continue; }
+            else
+                "$busybox" wget -O "$_zip" -T 20 \
+                    https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip 2>/dev/null || { _ok=0; continue; }
+            fi
+            # 用 unzip -t 验证完整性，避免“short read”的半截包
+            if "$busybox" unzip -tq "$_zip" >/dev/null 2>&1 || unzip -tq "$_zip" >/dev/null 2>&1; then
+                _ok=1; break
+            fi
+            echo "  下载不完整，重试 ..."
+        done
+        if [ "$_ok" != "1" ]; then
+            rm -f "$_zip"
+            echo "下载失败或文件不完整。"
+            echo "请在网络更好的环境手动下载后推送:"
+            echo "  curl -L -o dist.zip https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip"
+            echo "  adb push dist.zip /data/local/tmp/zz.zip"
+            echo "  su -c 'unzip -o /data/local/tmp/zz.zip -d ${_dir}'"
+            exit 1
         fi
-        "$busybox" unzip -oq /tmp/zashboard.zip -d "$_dir" 2>/dev/null || \
-            unzip -oq /tmp/zashboard.zip -d "$_dir"
-        rm -f /tmp/zashboard.zip
-        echo "完成。请把 external-ui 指向 ${_dir}"
+        # zip 内顶层就是 dist/ 目录，解压后把内容提到 _dir 下
+        "$busybox" unzip -oq "$_zip" -d "${core_dir}/.ui_tmp" 2>/dev/null || \
+            unzip -oq "$_zip" -d "${core_dir}/.ui_tmp"
+        if [ -d "${core_dir}/.ui_tmp/dist" ]; then
+            cp -af "${core_dir}/.ui_tmp/dist/." "$_dir/"
+        else
+            cp -af "${core_dir}/.ui_tmp/." "$_dir/"
+        fi
+        rm -rf "${core_dir}/.ui_tmp" "$_zip"
+        echo "完成: $(ls "$_dir" | wc -l) 个文件已就位"
+        echo "external-ui 应为: ${_dir}"
         ;;
     update-geo)
         echo "使用 mihomo 自带 geo 更新: 先删旧文件再重启内核"

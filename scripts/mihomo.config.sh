@@ -36,6 +36,11 @@ config_strip_keys() {
 }
 
 # 从用户配置里取出 tun 段中「模块不接管」的子键，原样保留
+#
+# 注意：必须按缩进跟踪「被接管子键的值块」。dns-hijack 这类列表的下级项
+# （如 `- "any:53"`）自身不带 `key:`，若只靠 key 名判断会被当成独立项重复
+# 输出，而且缩进只有 2 空格，落到生成的 tun 段里就把 YAML 结构弄坏
+# （典型报错：yaml: line N: did not find expected key）。
 config_user_tun_extra() {
     _f="$1"
     [ -f "$_f" ] || return 0
@@ -45,17 +50,28 @@ config_user_tun_extra() {
             own["auto-route"]; own["auto-detect-interface"]; own["dns-hijack"]
             own["include-package"]; own["exclude-package"]
             own["include-uid"]; own["exclude-uid"]
+            in_tun = 0; tun_indent = -1; skip_block = 0
         }
-        /^tun:/ { f = 1; next }
-        f && /^[^ \t]/ { f = 0 }
-        f && /^[ \t]*#/ { next }
-        f && NF {
+        /^tun:/ { in_tun = 1; tun_indent = -1; skip_block = 0; next }
+        in_tun && /^[^ \t]/ { in_tun = 0 }
+        !in_tun { next }
+        /^[ \t]*#/ { next }
+        !NF { next }
+        {
+            n = match($0, /[^ \t]/) - 1
             line = $0
             sub(/^[ \t]+/, "", line)
-            key = line
-            sub(/:.*/, "", key)
-            if (key in own) next
-            print "  " line
+            if (tun_indent < 0) tun_indent = n
+            if (n == tun_indent) {
+                key = line
+                sub(/:.*/, "", key)
+                skip_block = (key in own)
+                if (skip_block) next
+                print "  " line
+            } else if (n > tun_indent) {
+                if (skip_block) next
+                print "  " line
+            }
         }' "$_f"
 }
 
@@ -114,6 +130,24 @@ config_dns_listen_port() {
         f && /^[ \t]+listen:/ { sub(/^[ \t]+listen:[ \t]*/, ""); print; exit }' "$_f"
 }
 
+# 用户写了 dns 段但没写 listen（很常见：只关心 nameserver）时，mihomo 不会启动
+# DNS 服务器 —— 1053 端口没人监听，nat 表把 53 端口 REDIRECT 过来后全部超时，
+# 表现就是“所有应用都上不了网，但内核日志里一片正常”。
+# 这里在 dns 段第一行后插入 listen，用户自己写了 listen 则原样保留。
+config_dns_inject_listen() {
+    _f="$1"; _port="$2"
+    [ -f "$_f" ] || return 0
+    awk -v port="$_port" '
+        BEGIN { done = 0 }
+        {
+            print
+            if (!done && $0 ~ /^dns:[ \t]*$/) {
+                printf "  listen: 0.0.0.0:%s\n", port
+                done = 1
+            }
+        }' "$_f"
+}
+
 generate_runtime_config() {
     mkdir -p "$core_dir" 2>/dev/null
 
@@ -124,18 +158,31 @@ generate_runtime_config() {
 
     _tmp="${runtime_config}.new"
 
-    config_strip_keys "$user_config" tun external-controller tproxy-port > "$_tmp" || {
+    config_strip_keys "$user_config" tun external-controller tproxy-port external-ui > "$_tmp" || {
         set_error "读取 $user_config 失败"
         rm -f "$_tmp"; return 1
     }
 
-    if ! config_has_key "$user_config" external-controller; then
-        printf '\nexternal-controller: %s\n' "$external_controller" >> "$_tmp"
+    # external-controller 模块统一接管：用户配置里写了就用它的值，没写用 settings.ini 的
+    # （不能“用户写了就不补”——上面 strip 已经把这一键从运行时配置删掉了，
+    #  不补回来内核就完全不开 API 端口，面板会连不上）
+    _user_ctl=$(config_get "$user_config" external-controller)
+    _eff_ctl="${_user_ctl:-$external_controller}"
+    printf '\nexternal-controller: %s\n' "$_eff_ctl" >> "$_tmp"
+
+    # external-ui: 用户 config 里的旧值已在上一步 strip 掉；core/ui 就绪时自动挂上
+    # （action 按钮一键打开 web UI 依赖它）
+    if [ -n "$external_ui" ] && [ -d "$external_ui" ]; then
+        printf '\nexternal-ui: %s\n' "$external_ui" >> "$_tmp"
     fi
 
     if ! config_has_key "$user_config" dns; then
         printf '\n' >> "$_tmp"
         default_dns_block >> "$_tmp"
+    elif [ -z "$(config_dns_listen_port "$user_config")" ]; then
+        # 用户 dns 段缺 listen：注入监听地址，否则 dns_port 无人监听、DNS 全挂
+        config_dns_inject_listen "$_tmp" "$dns_port" > "${_tmp}.dns" && mv -f "${_tmp}.dns" "$_tmp"
+        log_msg "用户 dns 段缺少 listen，已注入 0.0.0.0:${dns_port}"
     fi
 
     printf '\n' >> "$_tmp"

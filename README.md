@@ -11,14 +11,15 @@
 - **按应用分流**：`package.list.cfg` 的黑/白名单，TPROXY 下翻译成 `-m owner --uid-owner` 规则，TUN 下翻译成 `include-package` / `exclude-package`。
 - **配置变更自动重载**：改动 `config.yaml` / `settings.ini` / `package.list.cfg` 后自动重启内核。
 - **无 ipset 依赖**：本模块只用 `iptables -m owner`，因为很多设备（含鸿蒙）没有 `ipset` / `-m set`。
-- **一键诊断**：`mihomo.tool check`（也可用模块管理器里的「操作」按钮）。
+- **一键诊断**：`mihomo.tool check`。
+- **内置 web 面板**：安装包带 zashboard，点模块管理器里的「操作」/「执行」按钮直接打开面板；终端窗口一闪而过看不到的东西全写到 `core/action.log`。
 
 ## 安装
 
 ```sh
 # Magisk / KernelSU：管理器里刷入 zip
 # APatch：
-apd module install /path/to/Mihomo-v1.0.0.zip
+apd module install /path/to/Mihomo-v1.1.0.zip
 ```
 
 安装过程中：
@@ -46,6 +47,8 @@ apd module install /path/to/Mihomo-v1.0.0.zip
     ├── config.yaml     # 模块生成的运行时配置（= 你的配置 + 补充段）
     ├── mihomo.log      # 内核 + 模块日志
     ├── mihomo.pid
+    ├── action.log       # 点「执行」按钮产生的日志（管理器关窗后仍可查）
+    ├── ui/              # zashboard 面板（安装包内置）
     ├── ports.env       # 实际生效的端口
     ├── uid.list        # 名单解析出的 uid
     ├── last_error      # 最近一次错误
@@ -59,7 +62,7 @@ apd module install /path/to/Mihomo-v1.0.0.zip
 ```ini
 network_mode=tproxy     # tproxy | tun
 tproxy_port=7893
-dns_port=1053
+dns_port=53
 tun_device=mihomo
 tun_stack=mixed         # mixed | system | gvisor
 tun_mtu=1500
@@ -69,10 +72,36 @@ table_id=2024
 pref_id=5200            # ip rule 优先级
 core_group=root:net_admin
 external_controller=127.0.0.1:9090
+external_ui=            # 留空则自动用 core/ui（面板已装时）
 config_watch=true       # 配置变更自动重载
 ```
 
 > 你在 `config.yaml` 里显式写了 `external-controller` 时，以 `config.yaml` 为准。
+> `external-ui` 例外：用户配置里的值会被剥掉，改由 `settings.ini` 的 `external_ui`
+> 或自动探测到的 `core/ui` 决定（否则面板目录一变就会失效）。
+
+## 点「操作」/「执行」按钮直接打开面板
+
+模块的 action（管理器里模块卡上的按钮）现在的行为是：
+
+1. 内核没跑就先启动
+2. 面板没装就下载 zashboard 到 `core/ui`
+3. `am start -a android.intent.action.VIEW -d http://127.0.0.1:9090/ui/` 打开浏览器
+4. 管理器那个一闪而过的终端窗口里看不到的细节，全部写到
+   `/data/adb/mihomo/core/action.log`
+
+日志查看方式：
+
+```sh
+adb shell su -c 'cat /data/adb/mihomo/core/action.log'
+# 或在 Termux 里
+su -c 'less /data/adb/mihomo/core/action.log'
+```
+
+安装包里**内置了 zashboard 面板**（322 个文件 / 13 MB），装完即用，不需要联网下载。
+手动重装面板：`$S/mihomo.tool dashboard`（会校验 zip 完整性并重试）。
+页面地址：`http://127.0.0.1:9090/ui/`；如果 `config.yaml` 里设了 `secret`，
+action 会自动拼上 `?secret=<值>`。
 
 ### `config/package.list.cfg`
 
@@ -98,13 +127,13 @@ com.example.app
 S=/data/adb/modules/mihomo_module/scripts
 
 $S/mihomo.tool start|stop|restart|status
-$S/mihomo.tool check                # 一键诊断（= 模块「操作」按钮）
+$S/mihomo.tool check                # 一键诊断
 $S/mihomo.tool switch tproxy|tun    # 切换网络模式（会重启）
 $S/mihomo.tool toggle on|off        # 临时启停
 $S/mihomo.tool mode blacklist|whitelist|off
 $S/mihomo.tool resolve-uid          # 重新解析名单 uid
 $S/mihomo.tool config-test          # 只校验你的 config.yaml
-$S/mihomo.tool dashboard [dir]      # 下载 zashboard 到 core/ui
+$S/mihomo.tool dashboard [dir]      # 重装 zashboard 面板到 core/ui
 $S/mihomo.tool update-geo           # 删掉本地 geo 数据后重启，让内核重新下载
 ```
 
@@ -116,8 +145,10 @@ $S/mihomo.tool update-geo           # 删掉本地 geo 数据后重启，让内�
 
 - `mangle PREROUTING → MIHOMO_TPROXY`：保留地址 RETURN，其余 TCP/UDP `TPROXY --on-port <tproxy_port>`
 - `mangle OUTPUT → MIHOMO_MARK`：先 RETURN 掉内核自身（uid 0 / gid net_admin），再按名单 MARK
-- `nat PREROUTING/OUTPUT → MIHOMO_DNS*`：把 53 端口 REDIRECT 到 `dns_port`
-- `ip rule fwmark <mark_id> lookup <table_id>` + `ip route add local default dev lo table <table_id>`
+- `nat PREROUTING/OUTPUT → MIHOMO_DNS*`：把 53 端口 REDIRECT 到 `dns_port`（默认就是 53，即直接监听 53；改成别的端口时才会真正 REDIRECT）
+- `ip rule fwmark <mark_id>/<mark_id> lookup <table_id>` + `ip route add local default dev lo table <table_id>`
+
+**策略路由的 `ip rule` 必须带掩码写成 `<mark_id>/<mark_id>`。** `MIHOMO_MARK` 里用的是 `MARK --set-xmark <mark_id>/<mark_id>`，语义是「按掩码按位或写入」，而 Android 的 socket 自带 netId 标记（wifi netId=100 → `0x10064`），实际 fwmark 变成 `0x10064|0x7e8 = 0x107ec`。若 `ip rule add fwmark 0x7e8`（掩码 `0xffffffff`，要求精确相等），就永远匹配不上：包会从 wlan0 直接发出去、`MIHOMO_TPROXY` 链零命中、应用侧表现为「连不上、DNS 正常但流量不代理」。历史上这里曾写成无掩码形式，是本模块最容易复发的坑。
 
 **注意：`mihomo` 的 fake-ip 段（默认 `198.18.0.1/16`）不能算作保留地址**，否则应用解析出的 fake-ip 会被直接放行。模块已把它排除在 RETURN 列表外。
 

@@ -12,6 +12,14 @@ rm -f "$out_dir/$name"
 
 includes="module.prop customize.sh service.sh action.sh uninstall.sh META-INF scripts config bin core"
 
+# web 面板（zashboard）可选：存在则打进包里，安装时落到 /data/adb/mihomo/core/ui
+if [ -d "ui" ] && [ -f "ui/index.html" ]; then
+    includes="$includes ui"
+    echo "包含 web 面板: $(find ui -type f | wc -l) 个文件"
+else
+    echo "提示: 未找到 ui/（web 面板），安装后首次点“执行”按钮时会自动下载"
+fi
+
 if command -v zip >/dev/null 2>&1; then
     # shellcheck disable=SC2086
     zip -r -9 -q "$out_dir/$name" $includes \
@@ -22,7 +30,7 @@ elif command -v python3 >/dev/null 2>&1; then
 import os, stat, sys, zipfile
 
 out, includes = sys.argv[1], sys.argv[2:]
-skip_dirs = {'.git', 'dist', 'build'}
+skip_dirs = {".git", "dist", "build"}
 skip_names = {'.DS_Store'}
 skip_suffixes = ('.log', '.pid')
 

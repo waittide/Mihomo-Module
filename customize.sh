@@ -273,6 +273,14 @@ install_data_dir() {
         fi
     done
 
+    # web 面板（zashboard）：安装包带了就刷新，action 按钮靠它一键开面板
+    if [ -f "$MODPATH/ui/index.html" ]; then
+        rm -rf "$data_dir/core/ui"
+        mkdir -p "$data_dir/core/ui"
+        cp -af "$MODPATH/ui/." "$data_dir/core/ui/" 2>/dev/null
+        ui_print_line "已部署 web 面板: $data_dir/core/ui"
+    fi
+
     # 用户配置：已存在绝不覆盖
     if [ ! -f "$data_dir/config/config.yaml" ]; then
         if [ -f "$MODPATH/config/config.yaml" ]; then
@@ -322,7 +330,7 @@ tun_reason=${probe_tun_reason}
 EOF
 
     # 安装包里的大文件已经落到 /data/adb/mihomo，模块目录只需保留脚本
-    rm -rf "$MODPATH/bin" "$MODPATH/core" "$MODPATH/config" 2>/dev/null
+    rm -rf "$MODPATH/bin" "$MODPATH/core" "$MODPATH/config" "$MODPATH/ui" 2>/dev/null
 }
 
 check_last_install() {
