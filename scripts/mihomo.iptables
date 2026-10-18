@@ -1,0 +1,279 @@
+#!/system/bin/sh
+# 防火墙规则：mihomo.iptables enable|disable|status|flush
+#
+# TPROXY 模式（默认）：
+#   mangle PREROUTING  -> MIHOMO_TPROXY : 局域网/保留地址 RETURN，其余 TPROXY --on-port <tproxy_port>
+#   mangle OUTPUT      -> MIHOMO_MARK   : 内核自身/按应用名单过滤后 MARK，走策略路由转回本机
+#   nat PREROUTING     -> MIHOMO_DNS    : udp/tcp 53 REDIRECT 到 <dns_port>
+#   nat OUTPUT         -> MIHOMO_DNS_OUT: 本机查询 53 REDIRECT 到 <dns_port>
+#   ip rule fwmark <mark> table <table> + ip route local default dev lo table <table>
+#
+# TUN 模式：不写任何规则，交给内核的 TUN 网卡处理（DNS 由 tun 的 dns-hijack 接管）。
+
+scripts_dir="${0%/*}"
+. "${scripts_dir}/mihomo.settings.sh"
+. "${scripts_dir}/mihomo.packages.sh"
+
+TPROXY_CHAIN="MIHOMO_TPROXY"
+MARK_CHAIN="MIHOMO_MARK"
+DNS_CHAIN="MIHOMO_DNS"
+DNS_OUT_CHAIN="MIHOMO_DNS_OUT"
+
+# 注意：不能把 mihomo 的 fake-ip 段（默认 198.18.0.1/16）列为保留地址，
+# 否则应用解析出的 fake-ip 会被直接放行而无法进入内核。
+RESERVED_V4="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
+172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 \
+198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 \
+255.255.255.255/32"
+
+RESERVED_V6="::1/128 fc00::/7 fe80::/10 ff00::/8"
+
+# ---------------------------------------------------------------- 工具
+
+ipt()  { $iptables_wait "$@" 2>/dev/null; }
+ip6t() { $ip6tables_wait "$@" 2>/dev/null; }
+
+have_ip6_nat() {
+    ip6tables -w 100 -t nat -L OUTPUT >/dev/null 2>&1
+}
+
+chain_exists() { iptables -w 100 -t "$1" -L "$2" -n >/dev/null 2>&1; }
+chain6_exists() { ip6tables -w 100 -t "$1" -L "$2" -n >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- 策略路由
+
+add_rule_route() {
+    # 先按 table 清干净，避免改过 mark_id 后旧规则残留
+    del_rules_for_table 4
+    del_rules_for_table 6
+    ip -4 rule add fwmark "$mark_id" table "$table_id" pref "$pref_id" 2>/dev/null
+    ip -4 route flush table "$table_id" 2>/dev/null
+    ip -4 route add local default dev lo table "$table_id" 2>/dev/null
+
+    if [ "$ipv6" = "true" ]; then
+        ip -6 rule add fwmark "$mark_id" table "$table_id" pref "$pref_id" 2>/dev/null
+        ip -6 route flush table "$table_id" 2>/dev/null
+        ip -6 route add local default dev lo table "$table_id" 2>/dev/null
+    fi
+    log_msg "策略路由已建立: fwmark ${mark_id} -> table ${table_id} (pref ${pref_id})"
+}
+
+# 删除所有指向本模块 table 的策略路由（按 table 而不是 mark 清）。
+# 原因：用户改过 settings.ini 的 mark_id 之后，旧 mark 的规则会残留
+# （实测出现过 0x7e8 / 0x7e9 两条并存）。
+# 注意设备上的 grep 是 toybox，不支持 `\b`，这里用 awk 按字段比对。
+#   del_rules_for_table <4|6>
+del_rules_for_table() {
+    ip -"$1" rule show 2>/dev/null | awk -v t="$table_id" '
+        {
+            for (i = 1; i < NF; i++)
+                if ($i == "lookup" && $(i + 1) == t) { print; next }
+        }' | while read -r _line; do
+            _pref=$(echo "$_line" | awk -F: '{print $1}')
+            [ -n "$_pref" ] && ip -"$1" rule del pref "$_pref" 2>/dev/null
+        done
+}
+
+del_rule_route() {
+    ip -4 rule del fwmark "$mark_id" table "$table_id" 2>/dev/null
+    ip -6 rule del fwmark "$mark_id" table "$table_id" 2>/dev/null
+    del_rules_for_table 4
+    del_rules_for_table 6
+    ip -4 route flush table "$table_id" 2>/dev/null
+    ip -6 route flush table "$table_id" 2>/dev/null
+    return 0
+}
+
+# ---------------------------------------------------------------- 链构建
+
+build_tproxy_chain() {
+    iptables -w 100 -t mangle -N "$TPROXY_CHAIN" 2>/dev/null
+    iptables -w 100 -t mangle -F "$TPROXY_CHAIN" 2>/dev/null
+
+    # 回环 / 组播 / 保留地址不过代理
+    for net in $RESERVED_V4; do
+        ipt -t mangle -A "$TPROXY_CHAIN" -d "$net" -j RETURN
+    done
+    # 不重复代理已被重定向的流量
+    ipt -t mangle -A "$TPROXY_CHAIN" -p tcp --dport "$eff_tproxy_port" -j RETURN
+    ipt -t mangle -A "$TPROXY_CHAIN" -p udp --dport "$eff_tproxy_port" -j RETURN
+    # DNS 交给 nat 的 REDIRECT，不在这里 TPROXY
+    ipt -t mangle -A "$TPROXY_CHAIN" -p udp --dport 53 -j RETURN
+    ipt -t mangle -A "$TPROXY_CHAIN" -p tcp --dport 53 -j RETURN
+
+    ipt -t mangle -A "$TPROXY_CHAIN" -p tcp -j TPROXY \
+        --on-port "$eff_tproxy_port" --tproxy-mark "$mark_id/$mark_id"
+    ipt -t mangle -A "$TPROXY_CHAIN" -p udp -j TPROXY \
+        --on-port "$eff_tproxy_port" --tproxy-mark "$mark_id/$mark_id"
+}
+
+build_mark_chain() {
+    iptables -w 100 -t mangle -N "$MARK_CHAIN" 2>/dev/null
+    iptables -w 100 -t mangle -F "$MARK_CHAIN" 2>/dev/null
+
+    for net in $RESERVED_V4; do
+        ipt -t mangle -A "$MARK_CHAIN" -d "$net" -j RETURN
+    done
+    ipt -t mangle -A "$MARK_CHAIN" -p tcp --dport "$eff_tproxy_port" -j RETURN
+    ipt -t mangle -A "$MARK_CHAIN" -p udp --dport "$eff_tproxy_port" -j RETURN
+    ipt -t mangle -A "$MARK_CHAIN" -p udp --dport 53 -j RETURN
+    ipt -t mangle -A "$MARK_CHAIN" -p tcp --dport 53 -j RETURN
+
+    # 内核自身流量（root + 内核用户组）必须绕过，否则回环
+    ipt -t mangle -A "$MARK_CHAIN" -m owner --uid-owner 0 -j RETURN
+    if [ -n "$core_gid_num" ]; then
+        ipt -t mangle -A "$MARK_CHAIN" -m owner --gid-owner "$core_gid_num" -j RETURN
+    fi
+
+    # 按应用分流
+    resolve_uids
+    if [ ${#uid_list[@]} -gt 0 ]; then
+        if [ "$proxy_mode" = "whitelist" ]; then
+            # 只有名单内的 uid 才走代理
+            for u in "${uid_list[@]}"; do
+                ipt -t mangle -A "$MARK_CHAIN" -m owner --uid-owner "$u" -j MARK \
+                    --set-xmark "$mark_id/$mark_id"
+            done
+        else
+            # 名单内的 uid 不走代理
+            for u in "${uid_list[@]}"; do
+                ipt -t mangle -A "$MARK_CHAIN" -m owner --uid-owner "$u" -j RETURN
+            done
+        fi
+    elif [ "$proxy_mode" = "whitelist" ]; then
+        log_msg "警告: whitelist 模式但名单为空，不会有任何流量走代理"
+    fi
+
+    if [ "$proxy_mode" != "whitelist" ] || [ ${#uid_list[@]} -eq 0 ]; then
+        ipt -t mangle -A "$MARK_CHAIN" -p tcp -j MARK --set-xmark "$mark_id/$mark_id"
+        ipt -t mangle -A "$MARK_CHAIN" -p udp -j MARK --set-xmark "$mark_id/$mark_id"
+    fi
+}
+
+build_dns_chains() {
+    iptables -w 100 -t nat -N "$DNS_CHAIN" 2>/dev/null
+    iptables -w 100 -t nat -F "$DNS_CHAIN" 2>/dev/null
+    for net in $RESERVED_V4; do
+        ipt -t nat -A "$DNS_CHAIN" -d "$net" -j RETURN
+    done
+    ipt -t nat -A "$DNS_CHAIN" -p udp --dport 53 -j REDIRECT --to-ports "$eff_dns_port"
+    ipt -t nat -A "$DNS_CHAIN" -p tcp --dport 53 -j REDIRECT --to-ports "$eff_dns_port"
+
+    iptables -w 100 -t nat -N "$DNS_OUT_CHAIN" 2>/dev/null
+    iptables -w 100 -t nat -F "$DNS_OUT_CHAIN" 2>/dev/null
+    # 内核进程自己向 nameserver 发起的查询不能再被 redirect 回来
+    ipt -t nat -A "$DNS_OUT_CHAIN" -m owner --uid-owner 0 -j RETURN
+    if [ -n "$core_gid_num" ]; then
+        ipt -t nat -A "$DNS_OUT_CHAIN" -m owner --gid-owner "$core_gid_num" -j RETURN
+    fi
+    for net in $RESERVED_V4; do
+        ipt -t nat -A "$DNS_OUT_CHAIN" -d "$net" -j RETURN
+    done
+    ipt -t nat -A "$DNS_OUT_CHAIN" -p udp --dport 53 -j REDIRECT --to-ports "$eff_dns_port"
+    ipt -t nat -A "$DNS_OUT_CHAIN" -p tcp --dport 53 -j REDIRECT --to-ports "$eff_dns_port"
+}
+
+build_ipv6_rules() {
+    # IPv6 没有 nat 表时无法 REDIRECT DNS，只能靠 mangle TPROXY
+    if have_ip6_nat; then
+        ip6tables -w 100 -t nat -N "$DNS_CHAIN" 2>/dev/null
+        ip6tables -w 100 -t nat -F "$DNS_CHAIN" 2>/dev/null
+        for net in $RESERVED_V6; do
+            ip6t -t nat -A "$DNS_CHAIN" -d "$net" -j RETURN
+        done
+        ip6t -t nat -A "$DNS_CHAIN" -p udp --dport 53 -j REDIRECT --to-ports "$eff_dns_port"
+        ip6t -t nat -A "$DNS_CHAIN" -p tcp --dport 53 -j REDIRECT --to-ports "$eff_dns_port"
+        ip6t -t nat -C PREROUTING -j "$DNS_CHAIN" 2>/dev/null || \
+            ip6t -t nat -A PREROUTING -j "$DNS_CHAIN"
+        ip6t -t nat -C OUTPUT -j "$DNS_CHAIN" 2>/dev/null || \
+            ip6t -t nat -A OUTPUT -j "$DNS_CHAIN"
+        return 0
+    fi
+
+    log_msg "本机 ip6tables 无 nat 表，IPv6 DNS 无法劫持：IPv6 流量将按 mihomo 的 tun/direct 处理"
+    return 1
+}
+
+# ---------------------------------------------------------------- 挂载/卸载
+
+apply_rules() {
+    load_settings
+    load_packages
+
+    if [ "$network_mode" != "tproxy" ]; then
+        log_msg "当前模式为 ${network_mode:-未选择}，无需 iptables 规则"
+        return 0
+    fi
+
+    iptables -w 100 -t mangle -N "$TPROXY_CHAIN" 2>/dev/null
+    build_tproxy_chain
+    build_mark_chain
+    build_dns_chains
+
+    add_rule_route
+
+    ipt -t mangle -C PREROUTING -j "$TPROXY_CHAIN" 2>/dev/null || \
+        ipt -t mangle -I PREROUTING 1 -j "$TPROXY_CHAIN"
+    ipt -t mangle -C OUTPUT -j "$MARK_CHAIN" 2>/dev/null || \
+        ipt -t mangle -I OUTPUT 1 -j "$MARK_CHAIN"
+    ipt -t nat -C PREROUTING -j "$DNS_CHAIN" 2>/dev/null || \
+        ipt -t nat -I PREROUTING 1 -j "$DNS_CHAIN"
+    ipt -t nat -C OUTPUT -j "$DNS_OUT_CHAIN" 2>/dev/null || \
+        ipt -t nat -I OUTPUT 1 -j "$DNS_OUT_CHAIN"
+
+    build_ipv6_rules
+
+    log_msg "iptables 规则已应用: mode=${proxy_mode} tproxy-port=${eff_tproxy_port} dns-port=${eff_dns_port}"
+    return 0
+}
+
+flush_rules() {
+    load_settings
+
+    ipt -t mangle -D PREROUTING -j "$TPROXY_CHAIN" 2>/dev/null
+    ipt -t mangle -D OUTPUT -j "$MARK_CHAIN" 2>/dev/null
+    ipt -t nat -D PREROUTING -j "$DNS_CHAIN" 2>/dev/null
+    ipt -t nat -D OUTPUT -j "$DNS_OUT_CHAIN" 2>/dev/null
+    ip6t -t nat -D PREROUTING -j "$DNS_CHAIN" 2>/dev/null
+    ip6t -t nat -D OUTPUT -j "$DNS_CHAIN" 2>/dev/null
+
+    ipt -t mangle -F "$TPROXY_CHAIN" 2>/dev/null
+    ipt -t mangle -X "$TPROXY_CHAIN" 2>/dev/null
+    ipt -t mangle -F "$MARK_CHAIN" 2>/dev/null
+    ipt -t mangle -X "$MARK_CHAIN" 2>/dev/null
+    ipt -t nat -F "$DNS_CHAIN" 2>/dev/null
+    ipt -t nat -X "$DNS_CHAIN" 2>/dev/null
+    ipt -t nat -F "$DNS_OUT_CHAIN" 2>/dev/null
+    ipt -t nat -X "$DNS_OUT_CHAIN" 2>/dev/null
+    ip6t -t nat -F "$DNS_CHAIN" 2>/dev/null
+    ip6t -t nat -X "$DNS_CHAIN" 2>/dev/null
+
+    del_rule_route
+    log_msg "iptables 规则已清理"
+    return 0
+}
+
+counters() {
+    echo "--- mangle ${TPROXY_CHAIN} ---"
+    iptables -w 100 -t mangle -L "$TPROXY_CHAIN" -v -n 2>/dev/null
+    echo "--- mangle ${MARK_CHAIN} ---"
+    iptables -w 100 -t mangle -L "$MARK_CHAIN" -v -n 2>/dev/null
+    echo "--- nat ${DNS_CHAIN} / ${DNS_OUT_CHAIN} ---"
+    iptables -w 100 -t nat -L "$DNS_CHAIN" -v -n 2>/dev/null
+    iptables -w 100 -t nat -L "$DNS_OUT_CHAIN" -v -n 2>/dev/null
+    echo "--- ip rule ---"
+    ip rule show 2>/dev/null | grep "lookup $table_id"
+    echo "--- ip route table $table_id ---"
+    ip route show table "$table_id" 2>/dev/null
+}
+
+case "$1" in
+    -s|enable)  apply_rules ;;
+    -k|disable) flush_rules ;;
+    -t|status)  counters ;;
+    -f|flush)   flush_rules ;;
+    *)
+        echo "用法: $0 {enable|disable|status}"
+        exit 1
+        ;;
+esac

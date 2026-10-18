@@ -1,0 +1,121 @@
+#!/system/bin/sh
+# 内核启停控制：mihomo.service start|stop|restart|status
+# 只负责「生成运行时配置 + 启动/停止内核」，防火墙规则由 mihomo.iptables 负责。
+
+scripts_dir="${0%/*}"
+. "${scripts_dir}/mihomo.settings.sh"
+. "${scripts_dir}/mihomo.config.sh"
+
+start_core() {
+    load_settings
+
+    if [ -z "$network_mode" ]; then
+        set_error "未选择网络模式（TUN/TPROXY 均不可用），请重新安装模块或修改 $settings_file"
+        return 1
+    fi
+
+    if [ ! -x "$bin_path" ]; then
+        set_error "找不到可执行内核: $bin_path（请把 mihomo 二进制放到该路径并 chmod 0755）"
+        return 1
+    fi
+
+    _running=$(clash_pid) && {
+        log_msg "内核已在运行 (pid ${_running})，跳过启动"
+        return 0
+    }
+
+    mkdir -p "$core_dir"
+    clear_error
+
+    # 读取按应用分流清单（tun 模式要把名单写进 tun 段，必须先于生成配置）
+    . "${scripts_dir}/mihomo.packages.sh"
+    load_packages || return 1
+
+    # 用户可能手改了设置里的端口，重新生成前先确认配置能过
+    generate_runtime_config || return 1
+
+    log_msg "启动内核: mode=${network_mode} bin=${bin_path}"
+
+    if [ -n "$busybox" ] && [ -x "$busybox" ]; then
+        nohup "$busybox" setuidgid "$core_group" "$bin_path" \
+            -d "$core_dir" -f "$runtime_config" >> "$log_file" 2>&1 &
+    else
+        nohup "$bin_path" -d "$core_dir" -f "$runtime_config" >> "$log_file" 2>&1 &
+    fi
+    _pid=$!
+    echo "$_pid" > "$pid_file"
+
+    # 最多等 10 秒确认进程存活；控制器一旦开始监听就提前结束
+    _ctl=$(effective_controller)
+    _port="${_ctl##*:}"
+    _i=0
+    while [ $_i -lt 20 ]; do
+        sleep 0.5
+        if ! kill -0 "$_pid" 2>/dev/null; then
+            echo "" > "$pid_file"
+            set_error "内核启动后立即退出: $(tail -3 "$log_file" | tr '\n' ' ')"
+            return 1
+        fi
+        port_listening "$_port" && break
+        _i=$((_i + 1))
+    done
+
+    if ! port_listening "$_port"; then
+        log_msg "警告: 控制器 ${_ctl} 尚未监听，请稍后用 mihomo.tool status 复查"
+    fi
+
+    log_msg "内核已启动 pid=${_pid} mode=${network_mode}"
+    return 0
+}
+
+stop_core() {
+    load_settings
+    _pid=$(clash_pid)
+    if [ -z "$_pid" ]; then
+        rm -f "$pid_file"
+        log_msg "内核未运行"
+        return 0
+    fi
+    kill "$_pid" 2>/dev/null
+    _i=0
+    while [ $_i -lt 20 ] && [ -d "/proc/$_pid" ]; do
+        sleep 0.5
+        _i=$((_i + 1))
+    done
+    [ -d "/proc/$_pid" ] && kill -9 "$_pid" 2>/dev/null
+    rm -f "$pid_file"
+    log_msg "内核已停止 pid=${_pid}"
+    return 0
+}
+
+status_core() {
+    load_settings
+    _pid=$(clash_pid)
+    echo "network_mode : ${network_mode:-未选择}"
+    echo "settings     : ${settings_file}"
+    echo "user config  : ${user_config}"
+    echo "runtime conf : ${runtime_config}"
+    echo "kernel       : ${bin_path}"
+    if [ -n "$_pid" ]; then
+        echo "status       : running (pid ${_pid})"
+    else
+        echo "status       : stopped"
+    fi
+    echo "tproxy-port  : ${tproxy_port:-未启用}"
+    echo "dns-port     : ${dns_port:-未启用}"
+    echo "controller   : $(effective_controller)"
+    _err=$(get_error)
+    [ -n "$_err" ] && echo "last error   : ${_err}"
+    return 0
+}
+
+case "$1" in
+    -s|start)   start_core ;;
+    -k|stop)    stop_core ;;
+    -r|restart) stop_core; start_core ;;
+    -t|status)  status_core ;;
+    *)
+        echo "用法: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac

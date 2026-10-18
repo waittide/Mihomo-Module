@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备目录
+        run: |
+          mkdir -p bin core
+          chmod 0755 scripts/* *.sh || true
+
+      - name: 下载 mihomo (arm64-v8)
+        run: |
+          tag=$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r .tag_name)
+          ver=${tag#v}
+          echo "mihomo $ver"
+          curl -fsSL -o /tmp/mihomo.gz \
+            "https://github.com/MetaCubeX/mihomo/releases/download/${tag}/mihomo-android-arm64-v8-${tag}.gz"
+          gunzip -c /tmp/mihomo.gz > bin/mihomo
+          chmod 0755 bin/mihomo
+          ./bin/mihomo -v
+
+      - name: 下载 geo 数据
+        run: |
+          base=https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest
+          curl -fsSL -o core/GeoIP.dat  "$base/geoip.dat"
+          curl -fsSL -o core/GeoSite.dat "$base/geosite.dat"
+          curl -fsSL -o core/Country.mmdb "$base/country.mmdb"
+          ls -lh core
+
+      - name: 打包
+        run: ./build.sh dist
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mihomo-module
+          path: dist/*.zip
+
+      - name: 发布 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip

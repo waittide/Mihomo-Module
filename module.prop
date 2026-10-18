@@ -1,0 +1,6 @@
+id=mihomo_module
+name=Mihomo
+version=v1.0.0
+versionCode=1
+author=waittide
+description=轻量 mihomo 模块：不改写你的 config.yaml，安装时可选 TPROXY / TUN，支持按应用分流。内核版本见 bin/mihomo。

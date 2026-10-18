@@ -1,0 +1,50 @@
+#!/sbin/sh
+#################
+# Initialization
+#################
+
+umask 022
+
+# echo before loading util_functions
+ui_print() { echo "$1"; }
+
+require_new_magisk() {
+  ui_print "*******************************"
+  ui_print " Please install Magisk v20.4+! "
+  ui_print "*******************************"
+  exit 1
+}
+
+#########################
+# Load util_functions.sh
+#########################
+
+OUTFD=$2
+ZIPFILE=$3
+
+mount /data 2>/dev/null
+
+if [ -f /data/adb/magisk/util_functions.sh ]; then
+    . /data/adb/magisk/util_functions.sh
+    [ "$MAGISK_VER_CODE" -lt 20400 ] && require_new_magisk
+    install_module
+    exit 0
+fi
+
+# 非 Magisk（KernelSU / APatch）管理器通常自己调用 customize.sh，
+# 若走到了这里说明管理器把 zip 交给了 update-binary，则自行完成安装。
+ui_print "- 未检测到 Magisk，使用内置安装流程"
+MODPATH="${MODPATH:-${TMPDIR:-/tmp}/mihomo_module}"
+mkdir -p "$MODPATH"
+unzip -oq "$ZIPFILE" -d "$MODPATH" || { ui_print "! 解压失败"; exit 1; }
+rm -rf "$MODPATH/META-INF"
+export MODPATH TMPDIR ZIPFILE
+sh "$MODPATH/customize.sh" || { ui_print "! customize.sh 执行失败"; exit 1; }
+
+target_dir=/data/adb/modules/mihomo_module
+mkdir -p "$target_dir"
+cp -af "$MODPATH/." "$target_dir/"
+rm -rf "$target_dir/customize.sh"
+chmod 0755 "$target_dir/service.sh" "$target_dir/action.sh" "$target_dir/uninstall.sh" 2>/dev/null
+chmod 0755 "$target_dir"/scripts/* 2>/dev/null
+exit 0

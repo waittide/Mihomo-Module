@@ -1,0 +1,10 @@
+# 打包产物与依赖（内核与 geo 数据不进仓库，由 CI 或本地脚本下载）
+bin/mihomo
+core/*.dat
+core/*.mmdb
+core/*.log
+core/*.pid
+dist/
+build/
+*.zip
+.DS_Store

@@ -1,0 +1,44 @@
+#!/system/bin/sh
+# 配置变更守护：轮询比对三个配置文件的指纹，变化后自动重启内核。
+#
+# 为什么不用 inotifyd：这台设备上一次保存会连发 c/c/w 三个事件（编辑器还会用
+# rename 落盘产生目录 M 事件），而重启内核要 5 秒以上，多事件合并、去抖、互斥
+# 都很容易出错（实测出现过「配置改了但防火墙规则被清掉」「一次保存触发三次重启」
+# 等半死状态）。轮询 2 秒的代价可以忽略，行为却完全确定。
+#
+# 由 service.sh 后台拉起，pid 写入 core/mihomo.watch.pid。
+
+scripts_dir="${0%/*}"
+. "${scripts_dir}/mihomo.settings.sh"
+
+load_settings
+[ "$config_watch" = "true" ] || exit 0
+
+mkdir -p "$core_dir"
+_pidfile="${core_dir}/mihomo.watch.pid"
+echo "$$" > "$_pidfile"
+
+_running=0
+cleanup() {
+    rm -f "$_pidfile"
+    exit 0
+}
+trap cleanup INT TERM HUP
+
+# 只对配置内容取指纹（不含运行时生成的 core/config.yaml）
+stamp() {
+    for _f in "$user_config" "$settings_file" "$package_file"; do
+        md5sum "$_f" 2>/dev/null
+    done | md5sum | awk '{print $1}'
+}
+
+_last=$(stamp)
+
+while true; do
+    sleep 2
+    _cur=$(stamp)
+    [ "$_cur" = "$_last" ] && continue
+    _last=$_cur
+    log_msg "配置变更，重启内核"
+    "${scripts_dir}/mihomo.tool" restart >> "${core_dir}/service.log" 2>&1
+done
