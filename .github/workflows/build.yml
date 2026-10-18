@@ -19,20 +19,27 @@ jobs:
           chmod 0755 scripts/* *.sh || true
 
       - name: 下载 mihomo (arm64-v8)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          tag=$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r .tag_name)
-          ver=${tag#v}
-          echo "mihomo $ver"
-          curl -fsSL -o /tmp/mihomo.gz \
-            "https://github.com/MetaCubeX/mihomo/releases/download/${tag}/mihomo-android-arm64-v8-${tag}.gz"
+          set -euo pipefail
+          api=https://api.github.com/repos/MetaCubeX/mihomo/releases/latest
+          tag=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+                 -H 'Accept: application/vnd.github+json' "$api" | jq -r .tag_name)
+          [ -n "$tag" ] && [ "$tag" != null ] || { echo '无法获取 mihomo release tag'; exit 1; }
+          echo "mihomo $tag"
+          # 资产名形如 mihomo-android-arm64-v8-v1.19.32.gz
+          url="https://github.com/MetaCubeX/mihomo/releases/download/${tag}/mihomo-android-arm64-v8-${tag}.gz"
+          curl -fsSL -o /tmp/mihomo.gz "$url"
           gunzip -c /tmp/mihomo.gz > bin/mihomo
           chmod 0755 bin/mihomo
           ./bin/mihomo -v
 
       - name: 下载 geo 数据
         run: |
+          set -euo pipefail
           base=https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest
-          curl -fsSL -o core/GeoIP.dat  "$base/geoip.dat"
+          curl -fsSL -o core/GeoIP.dat   "$base/geoip.dat"
           curl -fsSL -o core/GeoSite.dat "$base/geosite.dat"
           curl -fsSL -o core/Country.mmdb "$base/country.mmdb"
           ls -lh core
