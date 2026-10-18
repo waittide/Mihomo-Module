@@ -33,7 +33,11 @@ jobs:
           curl -fsSL -o /tmp/mihomo.gz "$url"
           gunzip -c /tmp/mihomo.gz > bin/mihomo
           chmod 0755 bin/mihomo
-          ./bin/mihomo -v
+          # 跑在 x86_64 runner 上，arm64 二进制不能直接执行，只做格式与大小校验
+          head -c 20 bin/mihomo | grep -q 'ELF' || { echo '不是有效的 ELF 文件'; exit 1; }
+          size=$(stat -c %s bin/mihomo)
+          echo "mihomo 二进制大小: $size 字节"
+          [ "$size" -gt 10000000 ] || { echo "二进制过小，下载可能失败"; exit 1; }
 
       - name: 下载 geo 数据
         run: |
