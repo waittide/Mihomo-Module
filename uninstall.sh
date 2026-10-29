@@ -5,10 +5,7 @@ MODDIR="${0%/*}"
 DATA_DIR=/data/adb/mihomo
 SCRIPTS="${MODDIR}/scripts"
 
-# 停内核 + 清规则（脚本可能已被管理器删除，做存在性判断）
-if [ -x "${SCRIPTS}/mihomo.iptables" ]; then
-    "${SCRIPTS}/mihomo.iptables" disable >/dev/null 2>&1
-fi
+# 停内核（脚本可能已被管理器删除，做存在性判断）
 if [ -x "${SCRIPTS}/mihomo.service" ]; then
     "${SCRIPTS}/mihomo.service" stop >/dev/null 2>&1
 fi
@@ -18,7 +15,7 @@ for _pf in "${DATA_DIR}/core/mihomo.pid"; do
     [ -f "$_pf" ] && kill "$(cat "$_pf" 2>/dev/null)" 2>/dev/null && rm -f "$_pf"
 done
 
-# 清理残留的 ip rule / ip route（mark/table 现在是模块内部固定值 2024）
+# 清理旧版本（TPROXY 时代）可能残留的 ip rule / ip route
 _mark=2024; _table=2024
 ip -4 rule show 2>/dev/null | awk -v t="$_table" '
     { for (i = 1; i < NF; i++) if ($i == "lookup" && $(i + 1) == t) { print; next } }' |

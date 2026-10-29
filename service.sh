@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# 开机自启：等系统启动完成后启动内核 + 防火墙规则
+# 开机自启：等系统启动完成后启动内核
 # 由 root 管理器在 post-fs-data 之后的 service 阶段执行。
 
 MODDIR="${0%/*}"
@@ -11,12 +11,6 @@ MODDIR="${0%/*}"
         sleep 2
         _wait=$((_wait + 1))
         [ $_wait -ge 120 ] && break
-    done
-    # 等待包管理就绪，package.list.cfg 的 uid 解析依赖它
-    _wait=0
-    while [ ! -f /data/system/packages.list ] && [ $_wait -lt 60 ]; do
-        sleep 2
-        _wait=$((_wait + 1))
     done
     sleep 3
 

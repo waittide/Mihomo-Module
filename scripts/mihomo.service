@@ -3,59 +3,10 @@
 #
 # 只做一件事：用用户自己的 ${user_config} 启动/停止 mihomo。
 # 不生成配置副本、不注入任何键——配置完全由 config.yaml 决定。
-# 防火墙规则只对 TPROXY 模式生效，由 mihomo.iptables 负责（由 mihomo.tool 调用）。
+# 配置是否正确由内核自己判断，模块不做前置校验。
 
 scripts_dir="${0%/*}"
 . "${scripts_dir}/mihomo.settings.sh"
-
-# 启动前检查配置里该有的键是否齐全，缺了直接报错（不自动补，见 README）
-check_config() {
-    if [ ! -f "$user_config" ]; then
-        set_error "找不到配置文件 $user_config"
-        return 1
-    fi
-
-    if [ -z "$network_mode" ]; then
-        set_error "配置里既没有 tun.enable: true，也没有 tproxy-port，无法确定运行模式。
-请在 $user_config 里二选一：
-  - 加 tun: 段并设置 enable: true（TUN 模式，内核自己建网卡和路由）
-  - 或用 tproxy-port: 7893（TPROXY 模式，需要 dns.listen 一起配好）"
-        return 1
-    fi
-
-    if [ "$config_conflict" = "1" ]; then
-        set_error "配置冲突：同时存在 tproxy-port 与 tun.enable: true。
-这两者不能同时启用——TUN 的 auto-route 会把默认路由指向 TUN 网卡，而 TPROXY
-的 mark 又把包抢回 lo，两者互相喂包会让流量全部不通（实测 http=000）。
-请二选一（模块不会替你改配置）：
-  - TPROXY：删掉整个 tun: 段，保留顶层 tproxy-port
-  - TUN    ：删掉顶层 tproxy-port，保留 tun: 段并 enable: true
-当前文件：$user_config"
-        return 1
-    fi
-
-    if [ "$network_mode" = "tproxy" ]; then
-        if [ -z "$eff_tproxy_port" ]; then
-            set_error "TPROXY 模式缺少 tproxy-port"
-            return 1
-        fi
-        if [ -z "$dns_port" ]; then
-            set_error "TPROXY 模式缺少 dns.listen，DNS 不会被劫持，所有应用都会解析失败。
-请在 $user_config 的 dns: 段里加一行（端口可自选）：
-  dns:
-    listen: 0.0.0.0:1053
-"
-            return 1
-        fi
-        # TPROXY + fake-ip 不兼容：198.18.0.0/16 的包会被内核判为 local 直接放行，
-        # 永远进不了 tproxy，表现为「能解析但连不上」。
-        _em=$(config_sub_get "$user_config" dns enhanced-mode)
-        if [ "$_em" = "fake-ip" ]; then
-            log_msg "警告: TPROXY 模式配 fake-ip 无法工作（198.18.0.0/16 走 local 路由被内核放行），请改成 redir-host"
-        fi
-    fi
-    return 0
-}
 
 # 串行化：手动 restart、action 按钮可能同时触发。无串行化时会同时
 # 启动多个内核实例（后起的因端口/网卡已被占用而「启动后立即退出」）。
@@ -126,22 +77,13 @@ _start_core_locked() {
     mkdir -p "$core_dir"
     clear_error
 
-    check_config || return 1
-
-    # TUN 模式的按应用分流由 mihomo 的 tun.include-package/exclude-package 负责，
-    # 用户直接写在 config.yaml 里，模块不介入；TPROXY 模式才需要解析 uid。
-    if [ "$network_mode" = "tproxy" ]; then
-        . "${scripts_dir}/mihomo.packages.sh"
-        load_packages || return 1
-    fi
-
     log_msg "启动内核: mode=${network_mode} bin=${bin_path} config=${user_config}"
 
     if [ -n "$busybox" ] && [ -x "$busybox" ]; then
         nohup "$busybox" setuidgid "$core_group" "$bin_path" \
             -d "$core_dir" -f "$user_config" >> "$log_file" 2>&1 &
     else
-        nohup "$bin_path" -d "$core_dir" -f "$_run_cfg" >> "$log_file" 2>&1 &
+        nohup "$bin_path" -d "$core_dir" -f "$user_config" >> "$log_file" 2>&1 &
     fi
     _pid=$!
     echo "$_pid" > "$pid_file"
@@ -223,8 +165,8 @@ status_core() {
     echo "user config  : ${user_config}"
     echo "kernel       : ${bin_path}"
     case "$network_mode" in
-        tun)    echo "network mode : tun（内核自建网卡/路由，模块不写 iptables）" ;;
-        tproxy) echo "network mode : tproxy（模块负责 iptables + 策略路由）" ;;
+        tun)    echo "network mode : tun（内核自建网卡/路由/规则）" ;;
+        tproxy) echo "network mode : tproxy（已无 iptables 支持，仅配置声明）" ;;
         *)      echo "network mode : 未确定（配置里缺 tun.enable / tproxy-port）" ;;
     esac
     if [ -n "$_pid" ]; then

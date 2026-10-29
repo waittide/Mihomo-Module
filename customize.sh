@@ -104,15 +104,7 @@ install_data_dir() {
         ui_print_line "保留已有配置: $data_dir/config/config.yaml"
     fi
 
-    # 分流清单：已存在则保留
-    if [ ! -f "$data_dir/config/package.list.cfg" ]; then
-        cp -f "$MODPATH/config/package.list.cfg" "$data_dir/config/package.list.cfg" 2>/dev/null
-    fi
-
-
-
     chmod 0755 "$data_dir" "$data_dir/bin" "$data_dir/core" "$data_dir/config" 2>/dev/null
-    chmod 0644 "$data_dir/config/"*.cfg 2>/dev/null
     chmod 0600 "$data_dir/config/config.yaml" 2>/dev/null
     chown -R 0:0 "$data_dir" 2>/dev/null
 
@@ -163,9 +155,9 @@ ui_print_line "数据目录: /data/adb/mihomo"
 ui_print_line "配置文件: /data/adb/mihomo/config/config.yaml"
 ui_print ""
 ui_print "配置决定运行模式，二选一（不能同时写）："
-ui_print "  TUN    : tun: {enable: true}   —— 网卡/路由/规则全部由内核自建"
-ui_print "  TPROXY : tproxy-port: 7893     —— 还需 dns: {listen: 0.0.0.0:53}"
-ui_print "                                   enhanced-mode 必须是 redir-host"
+ui_print "  TUN    : tun: {enable: true}   —— 网卡/路由/规则全部由内核自建（推荐）"
+ui_print "  TPROXY : tproxy-port: 7893     —— 模块不再建 iptables 规则，需自行配"
+ui_print "                                   策略路由与 nat 重定向"
 ui_print ""
 ui_print "改完配置执行一次重启生效:"
 ui_print "  /data/adb/modules/mihomo_module/scripts/mihomo.tool restart"

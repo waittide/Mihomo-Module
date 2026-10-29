@@ -1,40 +1,30 @@
 #!/system/bin/sh
-# 路径与公共工具函数，由 mihomo.service / mihomo.iptables / mihomo.tool 引入
+# 路径与公共工具函数，由 mihomo.service / mihomo.tool 引入
 #
 # 配置的唯一来源：${config_dir}/config.yaml（mihomo 原生配置，模块不生成副本、
-# 不改写它）。模块需要的一切参数都从该文件的原生键读取：
+# 不改写它）。模块只从该文件读几个展示用参数：
 #
-#   tproxy-port         TPROXY 转发端口
-#   dns.listen          DNS 重定向目标端口（TPROXY 模式必需）
-#   tun.enable          为 true 时走 TUN（内核自己建网卡/路由/规则，模块不碰 iptables）
+#   tproxy-port        仅用于 status/check 展示
+#   dns.listen         仅用于 status/check 展示
+#   tun.enable          为 true 时模式显示为 tun
 #   external-controller 面板地址
 #   secret              面板密码
-#   ipv6                是否建立 IPv6 规则
 #
 # 模式判定规则见 load_settings()。
 
 scripts_dir="${scripts_dir:-${0%/*}}"
-module_dir="${module_dir:-${scripts_dir%/scripts}}"
-[ "$module_dir" = "$scripts_dir" ] && module_dir="/data/adb/modules/mihomo_module"
 
 data_dir="${data_dir:-/data/adb/mihomo}"
 config_dir="$data_dir/config"
 core_dir="$data_dir/core"
 bin_path="$data_dir/bin/mihomo"
-bin_dir="$data_dir/bin"
-package_file="$config_dir/package.list.cfg"
 user_config="$config_dir/config.yaml"
-ui_dir="$core_dir/ui"
 pid_file="$core_dir/mihomo.pid"
 log_file="$core_dir/mihomo.log"
-uid_file="$core_dir/uid.list"
 error_file="$core_dir/last_error"
 
-# 模块内部固定参数（不暴露给用户，避免把 mihomo 配置和模块参数混在一起）
+# 内核进程身份
 core_group="root:net_admin"
-mark_id=2024
-table_id=2024
-pref_id=5200
 
 # ---------------------------------------------------------------- 配置读取
 
@@ -96,50 +86,19 @@ load_settings() {
         [ -n "$busybox" ] || busybox="$(command -v busybox 2>/dev/null)"
     }
 
-    core_user="${core_group%%:*}"
-    core_gid="${core_group##*:}"
-    [ -n "$core_user" ] || core_user="root"
-    [ -n "$core_gid" ] || core_gid="net_admin"
-
-    # 内核进程的 gid 数字（iptables 要排除它自己的流量，避免回环）
-    core_gid_num=""
-    if [ -n "$busybox" ] && [ -x "$busybox" ]; then
-        core_gid_num=$("$busybox" id -g "$core_gid" 2>/dev/null)
-    fi
-    [ -n "$core_gid_num" ] || core_gid_num=$(id -g "$core_gid" 2>/dev/null)
-    case "$core_gid_num" in
-        ''|*[!0-9]*) core_gid_num="" ;;
-    esac
-
-    iptables_wait="iptables -w 100"
-    ip6tables_wait="ip6tables -w 100"
-
-    # 从用户配置读端口
+    # 从用户配置读端口（仅用于展示）
     tproxy_port=$(config_get "$user_config" tproxy-port)
     dns_port=$(dns_listen_port)
-    ipv6=$(config_get "$user_config" ipv6)
-    [ -n "$ipv6" ] || ipv6="true"
 
-    # iptables 统一用 eff_* 两个名字
     eff_tproxy_port="$tproxy_port"
     eff_dns_port="$dns_port"
 
-    # 模式判定：TPROXY 优先，TUN 次之
-    #   有 tproxy-port            -> TPROXY（模块负责 iptables + 策略路由）
-    #   仅有 tun.enable: true     -> TUN（内核自己建网卡/路由/规则，模块不写 iptables）
-    #   两者都没有                -> 空，启动时直接报错
-    #
-    # 两者同时存在时取 TPROXY 并直接报错：实测 TUN 的 auto-route 会把默认路由
-    # 指向 TUN 网卡，而 TPROXY 的 mark 又把包抢回 lo，两者互相喂包 -> 流量全挂
-    # （http=000）。模块不替用户改配置、也不生成运行时副本，只把问题指出来。
+    # 模式判定（仅用于 status/check 展示，模块不据此做任何网络配置）
     network_mode=""
-    if [ -n "$tproxy_port" ] && tun_enabled; then
-        config_conflict="1"
-        network_mode="tproxy"
+    if tun_enabled; then
+        network_mode="tun"
     elif [ -n "$tproxy_port" ]; then
         network_mode="tproxy"
-    elif tun_enabled; then
-        network_mode="tun"
     fi
     return 0
 }
