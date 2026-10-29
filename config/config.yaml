@@ -1,19 +1,15 @@
 # Mihomo 配置——模块不改写这个文件，是唯一的配置来源。
 # 改完保存后执行一次重启生效: sh /data/adb/modules/mihomo_module/scripts/mihomo.tool restart
 #
-# 运行模式由本文件决定：二选一，不能同时写
-#   TPROXY : 写顶层 tproxy-port —— iptables 规则与策略路由由模块建立
-#   TUN    : 不写 tproxy-port、只写 tun.enable: true —— 网卡/路由/规则全部由内核自建
+# 运行模式由本文件决定，二选一：
+#   TUN    : 写 tun: 段并设置 enable: true —— 网卡/路由/规则全部由内核自建（默认，开箱可用）
+#   TPROXY : 写顶层 tproxy-port —— 模块只负责启停内核，不建立任何 iptables 规则与策略路由，
+#            mangle TPROXY、nat DNS 重定向、ip rule / ip route 都需要你自己配置
 #
-# 两者同时写会互相喂包（TUN 的 auto-route 把默认路由指向网卡，TPROXY 的 mark 又
-# 把包抢回 lo），流量直接不通。模块不替你猜，直接拒绝启动并提示删掉哪一个。
+# 两者同时写没有意义：TUN 的 auto-route 把默认路由指向网卡，TPROXY 的 mark 又把包
+# 抢回 lo，互相喂包会让流量全部不通。
 #
-# TPROXY 模式两条硬要求：
-#   1. dns.listen 必须写（否则 53 被劫持到不存在的端口，所有应用解析失败）
-#   2. enhanced-mode 必须是 redir-host（fake-ip 的 198.18.0.0/16 会被内核判为
-#      local 直接放行，永远进不了 tproxy，表现为「能解析但连不上」）
-#
-# 下面默认给的是 TPROXY 模式（UDP 全代理），TUN 配置见文件末尾注释。
+# 下面默认给的是 TUN 模式，TPROXY 写法见文件末尾注释。
 
 mixed-port: 7890
 allow-lan: false
@@ -32,27 +28,28 @@ profile:
   store-selected: true
   store-fake-ip: false
 
-# TPROXY 入站端口（透明代理收货口，应用不需要知道它）
-tproxy-port: 7893
-
-# 要用 TUN 就删掉上面那行 tproxy-port，并打开下面这一段：
-# tun:
-#   enable: true
-#   stack: mixed
-#   device: mihomo
-#   mtu: 1500
-#   auto-route: true            # TUN 必需：跟随 wifi/移动网络切换重建路由
-#   auto-detect-interface: true # 出站绑定正确的物理网卡
-#   dns-hijack:
-#     - "any:53"
-#   # auto-redirect 只在「不开 Android VPN、纯靠 iptables 抓流量」的场景需要，
-#   # 常规使用请留空（它是第二层劫持，和内核自身路由重复）。
+# TUN 入站：网卡、路由、dns 劫持全部由内核自己维护
+tun:
+  enable: true
+  stack: mixed
+  device: mihomo
+  mtu: 1500
+  auto-route: true            # TUN 必需：跟随 wifi/移动网络切换重建路由
+  auto-detect-interface: true # 出站绑定正确的物理网卡
+  dns-hijack:
+    - "any:53"
+  # 按应用分流（二选一，不能同时写）：
+  # include-package:            # 只代理名单内的应用
+  #   - com.android.chrome
+  # exclude-package:            # 名单内的应用直连
+  #   - com.tencent.mm
 
 dns:
   enable: true
   ipv6: true
   listen: 0.0.0.0:53
-  enhanced-mode: redir-host
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
   nameserver:
     - 223.5.5.5
     - 119.29.29.29
@@ -77,3 +74,13 @@ rules:
   - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
   - GEOIP,CN,DIRECT
   - MATCH,代理
+
+# ---- TPROXY 写法（要用就把上面的 tun: 段整段删掉，只保留下面这行）----
+# 模块不建立任何 iptables 规则，下面这些都要你自己配：
+#   mangle PREROUTING/OUTPUT → TPROXY --on-port <tproxy-port>，出站包打 mark
+#   nat PREROUTING/OUTPUT → REDIRECT 到 dns.listen 的端口
+#   ip rule fwmark <mark>/<mask> table <table> + 对应 ip route
+# 另外 enhanced-mode 必须用 redir-host：fake-ip 的 198.18.0.0/16 会被内核判为
+# local 直接放行，永远进不了 tproxy，表现为「能解析但连不上」。
+#
+# tproxy-port: 7893
